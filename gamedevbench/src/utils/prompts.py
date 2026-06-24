@@ -24,16 +24,41 @@ def load_task_config() -> Optional[dict]:
         return None
 
 
-def create_task_prompt(config: dict, use_runtime_video: bool = False, use_mcp: bool = False) -> str:
+# Light, open-ended "construct your own tests" nudge. Deliberately tells the
+# agent WHAT to do (verify behaviour against the spec) but not HOW (no script
+# template, no introspection idioms) so any effect is attributable to the
+# verification behaviour rather than to handing over the validator's technique.
+# See docs / CLAUDE.md for the experiment rationale.
+VERIFICATION_NUDGE_GUIDANCE = """
+    - Before you finish, verify your work actually behaves as the task describes. Do not stop at "it loads without errors".
+    - Re-read the instruction and turn it into the specific, observable behaviours it requires. Write a short throwaway GDScript test that loads the relevant scene/script and asserts each of those behaviours.
+    - Run it headlessly, e.g. `timeout 10 godot --headless --script verify.gd`, and confirm every assertion passes.
+    - Keep fixing your implementation (not the test) until it genuinely satisfies the intended behaviour.
+    """
+
+
+def create_task_prompt(
+    config: dict,
+    use_runtime_video: bool = False,
+    use_mcp: bool = False,
+    mcp_guidance: Optional[str] = None,
+    encourage_verification: bool = False,
+) -> str:
     """Create minimal task prompt with just the instruction.
 
     Args:
         config: Task configuration dict containing 'instruction' field
         use_runtime_video: Whether to append Godot runtime video instructions
         use_mcp: Whether to include MCP tool references
+        mcp_guidance: Guidance text for the selected MCP server. When ``use_mcp``
+            is set and this is None, the bundled screenshot guidance is used
+            (preserves the original baseline behavior).
+        encourage_verification: Whether to append the light "construct your own
+            tests to verify intended behaviour" nudge (experiment condition).
 
     Returns:
-        The instruction text with optional runtime video and MCP guidance
+        The instruction text with optional runtime video, MCP, and verification
+        guidance
     """
     try:
         if not config or "instruction" not in config:
@@ -58,22 +83,15 @@ def create_task_prompt(config: dict, use_runtime_video: bool = False, use_mcp: b
         instruction += runtime_guidance
 
     if use_mcp:
-        mcp_guidance = """
+        if mcp_guidance is None:
+            # Import locally to avoid a circular import at module load time.
+            from gamedevbench.src.mcp_registry import get_mcp_server
 
-You have access to a Godot MCP (Model Context Protocol) server that provides specialized tools for working with Godot projects.
-
-Available MCP Tools:
-- `godot-screenshot`: Takes a screenshot of the Godot editor to help you visualize the current state of the project.
-  - The game directory is the current directory (`./`)
-  - This is useful for understanding the scene hierarchy, node structure, and visual layout
-  - You can use this before making changes to understand the current state, and after to verify your changes
-
-When to use the MCP tools:
-- Before starting work: Use `godot-screenshot` to understand the current project structure
-- After making changes: Use `godot-screenshot` to verify your changes are correct
-- When debugging: Use `godot-screenshot` to see what the editor looks like and identify issues
-"""
+            mcp_guidance = get_mcp_server(None).prompt_guidance
         instruction += mcp_guidance
+
+    if encourage_verification:
+        instruction += VERIFICATION_NUDGE_GUIDANCE
 
     return instruction
 

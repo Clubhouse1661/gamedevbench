@@ -8,10 +8,14 @@ import json
 import time
 import os
 import subprocess
+import shutil
+import tempfile
 from pathlib import Path
 from typing import Any, Optional
 
 from gamedevbench.src.base_solver import BaseSolver
+from gamedevbench.src.godot_ai_lifecycle import maybe_godot_ai_editor_session
+from gamedevbench.src.mcp_registry import DEFAULT_MCP_SERVER, get_mcp_server
 from gamedevbench.src.utils.data_types import SolverResult, TokenUsage
 
 
@@ -31,45 +35,121 @@ class CodexSolver(BaseSolver):
         approval_policy: str = "never",      # untrusted | on-request | never
         sandbox: str = "danger-full-access",  # read-only | workspace-write | danger-full-access
         use_runtime_video: bool = False,
+        mcp_server: str = DEFAULT_MCP_SERVER,
     ):
         # Call parent constructor (handles MCP validation)
-        super().__init__(timeout_seconds, debug, use_mcp, use_runtime_video)
+        super().__init__(
+            timeout_seconds,
+            debug,
+            use_mcp,
+            use_runtime_video,
+            mcp_server=mcp_server,
+        )
 
         # Codex-specific parameters
         self.model = model
         self.approval_policy = approval_policy
         self.sandbox = sandbox
 
-        # Only configure MCP if enabled
-        if use_mcp:
-            self._ensure_mcp_config()
+    @staticmethod
+    def _toml_quote(value: str) -> str:
+        """Quote a string for the small TOML snippets this solver writes."""
+        return json.dumps(value)
 
-    def _ensure_mcp_config(self):
-        """Ensure ~/.codex/config.toml contains godot-screenshot MCP server config."""
-        config_dir = Path.home() / ".codex"
-        config_file = config_dir / "config.toml"
+    @classmethod
+    def _format_stdio_mcp_config(
+        cls, server_id: str, command: str, args: list[str]
+    ) -> str:
+        args_toml = ", ".join(cls._toml_quote(arg) for arg in args)
+        return (
+            f"[mcp_servers.{server_id}]\n"
+            f"command = {cls._toml_quote(command)}\n"
+            f"args = [{args_toml}]\n"
+        )
 
-        mcp_config = '''
-[mcp_servers.godot-screenshot]
-command = "uv"
-args = ["run", "gamedevbench-mcp"]
-'''
+    @classmethod
+    def _format_http_mcp_config(cls, server_id: str, url: str) -> str:
+        return (
+            f"[mcp_servers.{server_id}]\n"
+            f"url = {cls._toml_quote(url)}\n"
+            "enabled = true\n"
+            "tool_timeout_sec = 60\n"
+        )
 
-        config_dir.mkdir(parents=True, exist_ok=True)
+    @classmethod
+    def _build_codex_mcp_config(cls, selected_server: str, http_url: str = "") -> str:
+        """Build the isolated Codex MCP config for this task.
 
-        if config_file.exists():
-            content = config_file.read_text()
-            if "godot-screenshot" not in content:
-                # Append MCP config
-                with open(config_file, 'a') as f:
-                    f.write("\n" + mcp_config)
-                if self.debug:
-                    print(f"Added godot-screenshot MCP config to {config_file}")
-        else:
-            # Create new config file
-            config_file.write_text(mcp_config.strip())
-            if self.debug:
-                print(f"Created Codex config at {config_file}")
+        The screenshot server is the historical Codex MCP baseline. Keep it in
+        generated configs so adding a task-local godot-ai endpoint does not
+        silently remove existing Codex benchmark capability.
+        """
+        screenshot = get_mcp_server(DEFAULT_MCP_SERVER)
+        sections = [
+            cls._format_stdio_mcp_config(
+                screenshot.server_id,
+                screenshot.command,
+                list(screenshot.args),
+            )
+        ]
+        if selected_server != DEFAULT_MCP_SERVER:
+            spec = get_mcp_server(selected_server)
+            if spec.transport == "http":
+                sections.append(
+                    cls._format_http_mcp_config(
+                        spec.server_id, http_url or spec.http_url
+                    )
+                )
+            else:
+                sections.append(
+                    cls._format_stdio_mcp_config(
+                        spec.server_id,
+                        spec.command,
+                        list(spec.args),
+                    )
+                )
+        return "\n".join(section.rstrip() for section in sections) + "\n"
+
+    @staticmethod
+    def _copy_auth_if_needed(codex_home: Path) -> None:
+        """Let temp CODEX_HOME reuse file-based auth when no API key is set.
+
+        Codex automation can use CODEX_API_KEY directly. For local runs that
+        rely on an existing CLI login, copy only auth.json into the task-local
+        temp home and delete it with the temp directory after the run.
+        """
+        if os.environ.get("CODEX_API_KEY"):
+            return
+        source_home = Path(os.environ.get("CODEX_HOME") or (Path.home() / ".codex"))
+        auth = source_home / "auth.json"
+        if auth.exists():
+            shutil.copy2(auth, codex_home / "auth.json")
+
+    def _prepare_codex_home(self, http_url: str = "") -> tempfile.TemporaryDirectory:
+        """Create a per-task Codex home containing only benchmark MCP config."""
+        temp_home = tempfile.TemporaryDirectory(prefix="gamedevbench_codex_")
+        codex_home = Path(temp_home.name)
+        config = self._build_codex_mcp_config(self.mcp_server, http_url=http_url)
+        (codex_home / "config.toml").write_text(config, encoding="utf-8")
+        self._copy_auth_if_needed(codex_home)
+        if self.debug:
+            print(f"Created isolated Codex config at {codex_home / 'config.toml'}")
+        return temp_home
+
+    @staticmethod
+    def _codex_command() -> str:
+        """Resolve the Codex launcher to a subprocess-safe executable.
+
+        On Windows, npm installs both an extensionless shim and a .cmd wrapper.
+        ``CreateProcess`` can pick the extensionless shim first and fail with
+        ``Access is denied``; prefer the batch/exe wrappers explicitly.
+        """
+        if os.name == "nt":
+            for candidate in ("codex.cmd", "codex.bat", "codex.exe", "codex"):
+                resolved = shutil.which(candidate)
+                if resolved:
+                    return resolved
+        return shutil.which("codex") or "codex"
 
     @staticmethod
     def _coerce_int(value: Any) -> int:
@@ -166,83 +246,98 @@ args = ["run", "gamedevbench-mcp"]
             print(prompt)
             print("=" * 60)
 
+        codex_home_temp = None
         try:
-            # Build codex exec command
-            cmd = ["codex"]
+            with maybe_godot_ai_editor_session(
+                enabled=self.use_mcp,
+                mcp_spec=self.mcp_spec,
+                project_dir=Path(os.getcwd()),
+                debug=self.debug,
+            ) as editor_session:
+                http_url = editor_session.http_url if editor_session else ""
 
-            if self.approval_policy:
-                cmd.extend(["-a", self.approval_policy])
+                codex_env = None
+                if self.use_mcp:
+                    codex_home_temp = self._prepare_codex_home(http_url=http_url)
+                    codex_env = {**os.environ, "CODEX_HOME": codex_home_temp.name}
 
-            cmd.extend(["exec", "--skip-git-repo-check", "--json"])
+                # Build codex exec command
+                cmd = [self._codex_command()]
 
-            if self.model:
-                cmd.extend(["-m", self.model])
+                if self.approval_policy:
+                    cmd.extend(["-a", self.approval_policy])
 
-            cmd.extend(["-s", self.sandbox, "-C", str(os.getcwd()), prompt])
+                cmd.extend(["exec", "--skip-git-repo-check", "--json"])
 
-            if self.debug:
-                cmd_str = " ".join([c if " " not in c else f'"{c}"' for c in cmd[:-1]])
-                print(f"Running: {cmd_str} \"...\"")
-                print("\nCODEX TRAJECTORY:")
-                print("=" * 60)
+                if self.model:
+                    cmd.extend(["-m", self.model])
 
-            # Run Codex
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=self.timeout_seconds,
-                cwd=os.getcwd(),
-            )
+                cmd.extend(["-s", self.sandbox, "-C", str(os.getcwd()), prompt])
 
-            duration = time.time() - start_time
-            stdout = result.stdout
-            stderr = result.stderr
+                if self.debug:
+                    cmd_str = " ".join([c if " " not in c else f'"{c}"' for c in cmd[:-1]])
+                    print(f"Running: {cmd_str} \"...\"")
+                    print("\nCODEX TRAJECTORY:")
+                    print("=" * 60)
 
-            if self.debug:
-                # Parse and print key events
-                self._print_trajectory(stdout)
-                print(f"\n\nDuration: {duration:.2f} seconds")
-                print(f"Exit code: {result.returncode}")
-                if stderr:
-                    print(f"Stderr: {stderr[:500]}")
-                print("=" * 60)
+                # Run Codex
+                result = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=self.timeout_seconds,
+                    cwd=os.getcwd(),
+                    env=codex_env,
+                )
 
-            # Parse final response and token usage
-            final_response = self._parse_final_response(stdout)
-            token_usage = self._parse_token_usage(stdout)
-            model_used = self._parse_model_name(stdout) or self.model or "codex"
+                duration = time.time() - start_time
+                stdout = result.stdout
+                stderr = result.stderr
 
-            # Calculate cost
-            cost_usd = 0.0
-            if token_usage:
-                cost_usd = token_usage.calculate_cost(model_used)
+                if self.debug:
+                    # Parse and print key events
+                    self._print_trajectory(stdout)
+                    print(f"\n\nDuration: {duration:.2f} seconds")
+                    print(f"Exit code: {result.returncode}")
+                    if stderr:
+                        print(f"Stderr: {stderr[:500]}")
+                    print("=" * 60)
 
-            if self.debug and token_usage:
-                print(f"Tokens: input={token_usage.input_tokens}, output={token_usage.output_tokens}, total={token_usage.total_tokens}")
-                print(f"Cost: ${cost_usd:.4f}")
+                # Parse final response and token usage
+                final_response = self._parse_final_response(stdout)
+                token_usage = self._parse_token_usage(stdout)
+                model_used = self._parse_model_name(stdout) or self.model or "codex"
 
-            # Construct message: include stderr if command failed
-            if result.returncode != 0:
-                error_msg = f"Codex command failed (exit code {result.returncode})"
-                if stderr and stderr.strip():
-                    error_msg += f"\nSTDERR: {stderr.strip()}"
-                if final_response:
-                    error_msg += f"\nFinal response: {final_response}"
-                message = error_msg
-            else:
-                message = final_response or "No response detected."
+                # Calculate cost
+                cost_usd = 0.0
+                if token_usage:
+                    cost_usd = token_usage.calculate_cost(model_used)
 
-            return SolverResult(
-                success=result.returncode == 0,
-                message=message,
-                duration_seconds=duration,
-                stdout=stdout,
-                stderr=stderr,
-                token_usage=token_usage,
-                model=model_used,
-                cost_usd=cost_usd,
-            )
+                if self.debug and token_usage:
+                    print(f"Tokens: input={token_usage.input_tokens}, output={token_usage.output_tokens}, total={token_usage.total_tokens}")
+                    print(f"Cost: ${cost_usd:.4f}")
+
+                # Construct message: include stderr if command failed
+                if result.returncode != 0:
+                    error_msg = f"Codex command failed (exit code {result.returncode})"
+                    if stderr and stderr.strip():
+                        error_msg += f"\nSTDERR: {stderr.strip()}"
+                    if final_response:
+                        error_msg += f"\nFinal response: {final_response}"
+                    message = error_msg
+                else:
+                    message = final_response or "No response detected."
+
+                return SolverResult(
+                    success=result.returncode == 0,
+                    message=message,
+                    duration_seconds=duration,
+                    stdout=stdout,
+                    stderr=stderr,
+                    token_usage=token_usage,
+                    model=model_used,
+                    cost_usd=cost_usd,
+                )
 
         except subprocess.TimeoutExpired:
             duration = time.time() - start_time
@@ -274,6 +369,9 @@ args = ["run", "gamedevbench-mcp"]
                 duration_seconds=duration,
                 is_rate_limited=is_rate_limited,
             )
+        finally:
+            if codex_home_temp is not None:
+                codex_home_temp.cleanup()
 
     def _print_trajectory(self, output: str):
         """Print key events from Codex execution trajectory."""
@@ -283,27 +381,35 @@ args = ["run", "gamedevbench-mcp"]
             try:
                 event = json.loads(line)
                 event_type = event.get("type", "")
+                item = event.get("item", {})
+                item_type = item.get("type") if isinstance(item, dict) else ""
 
                 if event_type == "turn.started":
                     print(f"\n[Turn Started]")
-                elif event_type == "item.tool_call":
-                    tool_name = event.get("name", "unknown")
-                    args = event.get("arguments", {})
-                    print(f"\n[Tool Call] {tool_name}({json.dumps(args)[:100]})")
+                elif event_type == "item.tool_call" or item_type == "mcp_tool_call":
+                    tool_name = item.get("tool") or event.get("name", "unknown")
+                    server = item.get("server")
+                    args = item.get("arguments") or event.get("arguments", {})
+                    label = f"{server}.{tool_name}" if server else tool_name
+                    print(f"\n[Tool Call] {label}({json.dumps(args)[:100]})")
                 elif event_type == "item.tool_result":
-                    print(f"[Tool Result] received")
-                elif event_type == "item.message":
-                    content = event.get("content", "")
+                    print("[Tool Result] received")
+                elif event_type == "item.message" or item_type == "agent_message":
+                    content = item.get("text") or event.get("content", "")
                     if content:
                         preview = content[:200] + "..." if len(content) > 200 else content
                         print(f"[Message] {preview}")
                 elif event_type == "turn.completed":
-                    print(f"\n[Turn Completed]")
-                elif event_type == "item.file_edit":
+                    print("\n[Turn Completed]")
+                elif event_type == "item.file_edit" or item_type == "file_change":
                     file_path = event.get("path", "unknown")
+                    if item_type == "file_change":
+                        changes = item.get("changes") or []
+                        if changes and isinstance(changes[0], dict):
+                            file_path = changes[0].get("path", file_path)
                     print(f"[File Edit] {file_path}")
-                elif event_type == "item.shell_command":
-                    cmd = event.get("command", "")
+                elif event_type == "item.shell_command" or item_type == "command_execution":
+                    cmd = item.get("command") or event.get("command", "")
                     print(f"[Shell] {cmd[:100]}")
 
             except json.JSONDecodeError:
@@ -319,11 +425,16 @@ args = ["run", "gamedevbench-mcp"]
                 continue
             try:
                 event = json.loads(line)
+                item = event.get("item", {})
                 if event.get("type") == "turn.completed":
-                    final_response = event.get("finalResponse", "")
+                    final_response = event.get("finalResponse", "") or final_response
                 elif event.get("type") == "item.message":
                     # Save last message as fallback
                     content = event.get("content", "")
+                    if content:
+                        final_response = content
+                elif isinstance(item, dict) and item.get("type") == "agent_message":
+                    content = item.get("text", "")
                     if content:
                         final_response = content
             except json.JSONDecodeError:

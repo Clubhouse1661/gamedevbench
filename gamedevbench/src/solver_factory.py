@@ -5,11 +5,15 @@ Uses registry pattern for modular solver management.
 """
 from typing import Dict, Type, Optional
 from gamedevbench.src.base_solver import BaseSolver
+from gamedevbench.src.mcp_registry import (
+    DEFAULT_MCP_SERVER,
+    available_mcp_servers,
+    get_mcp_server,
+)
 from gamedevbench.src.claude_code_solver import ClaudeCodeSolver
 from gamedevbench.src.mini_swe_solver import MiniSweSolver
 from gamedevbench.src.codex_solver import CodexSolver
 from gamedevbench.src.gemini_solver import GeminiSolver
-from gamedevbench.src.opencode_solver import OpenCodeSolver
 
 # OpenHands requires Python 3.12+, make it optional
 try:
@@ -29,12 +33,22 @@ class SolverFactory:
         "mini-swe": MiniSweSolver,
         "codex": CodexSolver,
         "gemini-cli": GeminiSolver,
-        "opencode": OpenCodeSolver,
     }
 
     # Conditionally add OpenHands if available
     if OPENHANDS_AVAILABLE:
         _SOLVER_REGISTRY["openhands"] = OpenHandsSolver
+
+    _MCP_SERVER_ALLOWLIST = {
+        "codex": {DEFAULT_MCP_SERVER, "godot-ai"},
+    }
+
+    @classmethod
+    def supported_mcp_servers(cls, agent: str) -> set[str]:
+        """Return MCP servers wired for an agent."""
+        if agent == "openhands":
+            return set(available_mcp_servers())
+        return cls._MCP_SERVER_ALLOWLIST.get(agent, {DEFAULT_MCP_SERVER})
 
     @classmethod
     def create_solver(
@@ -45,23 +59,33 @@ class SolverFactory:
         use_mcp: bool = False,
         timeout_seconds: int = 600,
         use_runtime_video: bool = False,
+        mcp_server: str = DEFAULT_MCP_SERVER,
+        encourage_verification: bool = False,
     ) -> BaseSolver:
         """
         Create a solver instance based on agent type.
 
         Args:
-            agent: Agent name (e.g., "claude-code", "mini-swe", "openhands", "codex", "gemini-cli", "opencode")
+            agent: Agent name (e.g., "claude-code", "mini-swe", "openhands", "codex", "gemini-cli")
             debug: Enable debug output
             model: Model name (used by solvers that support model selection)
             use_mcp: Enable MCP server functionality (will validate solver supports it)
             timeout_seconds: Maximum time for solver execution
             use_runtime_video: Enable runtime video mode (appends Godot runtime instructions to prompts)
+            mcp_server: Name of the MCP server to use when use_mcp is set.
+                OpenHands honors every registered server; Codex currently
+                honors the screenshot baseline and godot-ai.
+            encourage_verification: Append the light "construct your own tests"
+                nudge. Only solvers with SUPPORTS_VERIFICATION_NUDGE (OpenHands)
+                accept it; requesting it for any other agent raises.
 
         Returns:
             Configured solver instance
 
         Raises:
-            ValueError: If agent is unknown or if MCP is requested but not supported
+            ValueError: If agent is unknown, if MCP is requested but not
+                supported, or if encourage_verification is requested but not
+                supported
             RuntimeError: If OpenHands is requested but Python version < 3.12
         """
         # Check if agent exists in registry
@@ -87,6 +111,29 @@ class SolverFactory:
                 f"Solvers with MCP support: {cls.get_mcp_capable_solvers()}"
             )
 
+        # Validate verification-nudge support (mirrors the MCP guard). Gated to
+        # SUPPORTS_VERIFICATION_NUDGE solvers because the nudge is wired in via
+        # the solver constructor (only OpenHands forwards it today).
+        if encourage_verification and not getattr(
+            solver_class, "SUPPORTS_VERIFICATION_NUDGE", False
+        ):
+            raise ValueError(
+                f"Agent '{agent}' does not support --encourage-verification. "
+                f"Use --agent openhands or drop the flag."
+            )
+
+        # Validate the server name early (fails fast on a typo) and guard
+        # per-agent wiring explicitly. An unwired server must fail loudly rather
+        # than silently producing a default or partial MCP config.
+        get_mcp_server(mcp_server)
+        allowed_servers = cls.supported_mcp_servers(agent)
+        if use_mcp and mcp_server not in allowed_servers:
+            raise ValueError(
+                f"Selecting MCP server '{mcp_server}' is not supported with "
+                f"agent '{agent}'. Supported for this agent: "
+                f"{', '.join(sorted(allowed_servers))}."
+            )
+
         # Build kwargs based on what each solver accepts
         kwargs = {
             "debug": debug,
@@ -95,9 +142,9 @@ class SolverFactory:
         }
 
         # Add model parameter for solvers that support it
-        if agent in ["claude-code", "mini-swe", "openhands", "gemini-cli", "codex", "opencode"]:
+        if agent in ["claude-code", "mini-swe", "openhands", "gemini-cli", "codex"]:
             should_pass_model = bool(model)
-            if agent in ["gemini-cli", "codex", "opencode"] and model == "claude":
+            if agent in ["gemini-cli", "codex"] and model == "claude":
                 should_pass_model = False
 
             if should_pass_model:
@@ -106,6 +153,17 @@ class SolverFactory:
         # Add use_mcp for solvers that support it
         if solver_class.SUPPORTS_MCP:
             kwargs["use_mcp"] = use_mcp
+
+        # Pass server selections only to solvers that accept them.
+        if agent in {"openhands", "codex"}:
+            kwargs["mcp_server"] = mcp_server
+
+        # Pass the verification nudge to any solver that accepts it (gated by the
+        # capability flag, like use_mcp above). Solvers without support already
+        # raised above, so this never reaches a solver whose __init__ lacks the
+        # kwarg.
+        if getattr(solver_class, "SUPPORTS_VERIFICATION_NUDGE", False):
+            kwargs["encourage_verification"] = encourage_verification
 
         # Create and return solver instance
         # The BaseSolver.__init__ will perform final validation

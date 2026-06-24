@@ -10,9 +10,15 @@ import re
 import yaml
 import tempfile
 import uuid
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+
+from gamedevbench.src.utils.env import load_project_env
+
+# Populate os.environ from .env before any module reads config/credentials.
+load_project_env()
 
 from gamedevbench.src.utils.constants import (
     TASKS_DIR,
@@ -22,10 +28,26 @@ from gamedevbench.src.utils.constants import (
     TEST_SCENE_NAME,
     RESULTS_FOLDER,
     TIMEOUT,
+    SANDBOX_IMPORT_TIMEOUT,
 )
 from gamedevbench.src.utils.data_types import ValidationResult
 from gamedevbench.src.utils.validation import ValidationParser
 from gamedevbench.src.solver_factory import SolverFactory
+from gamedevbench.src.mcp_registry import (
+    DEFAULT_MCP_SERVER,
+    available_mcp_servers,
+    get_mcp_server,
+)
+
+
+def _run_task_in_worker(runner: "GodotBenchmarkRunner", task_name: str) -> Dict:
+    """Run a single task end-to-end in a worker process.
+
+    Defined at module level so it can be pickled and dispatched to a
+    ProcessPoolExecutor. Each worker gets its own process, which keeps the
+    solver's os.chdir into the sandbox isolated from sibling tasks.
+    """
+    return runner.run_benchmark(task_name)
 
 
 class GodotBenchmarkRunner:
@@ -41,6 +63,9 @@ class GodotBenchmarkRunner:
         skip_display: bool = False,
         use_runtime_video: bool = False,
         run_name: Optional[str] = None,
+        workers: int = 1,
+        mcp_server: str = DEFAULT_MCP_SERVER,
+        encourage_verification: bool = False,
     ):
         """
         Initialize the benchmark runner.
@@ -56,6 +81,12 @@ class GodotBenchmarkRunner:
             skip_display: Skip tasks that require display (requires_display=true in task_config.json)
             use_runtime_video: Enable runtime video mode (appends Godot runtime instructions to prompts)
             run_name: Optional name used to isolate result files for this run
+            encourage_verification: Append the light "construct your own tests to
+                verify intended behaviour" nudge to task prompts (OpenHands only)
+            workers: Number of tasks to run concurrently. Each task runs in its
+                own process (the agent solve step relies on a process-global
+                os.chdir into the sandbox, so processes — not threads — are
+                required for isolation). Defaults to 1 (sequential).
         """
         self.godot_path = GODOT_EXEC_PATH
         if use_gt:
@@ -84,9 +115,26 @@ class GodotBenchmarkRunner:
         safe_model = model.replace("/", "_") if model else "default"
         self.progress_file = self.results_dir / f"progress_{agent}_{safe_model}.json"
         self.use_mcp = use_mcp
+        self.mcp_server = mcp_server
+        self.mcp_spec = get_mcp_server(mcp_server)
         self.resume_from = resume_from
         self.skip_display = skip_display
         self.use_runtime_video = use_runtime_video
+        self.encourage_verification = encourage_verification
+        self.workers = max(1, int(workers))
+
+        # Only MCP servers that grab a host-global resource force sequential
+        # runs: the screenshot baseline captures a whole monitor. Headless stdio
+        # servers (godot-mcp) and godot-ai (per-task editor on its own free ports
+        # + isolated editor state) run as independent processes, so parallelism
+        # is safe for them.
+        if self.use_mcp and self.mcp_spec.requires_single_worker and self.workers > 1:
+            print(
+                f"⚠️  MCP server '{self.mcp_server}' captures a full monitor — "
+                f"forcing workers=1 (was {self.workers}); parallel runs would "
+                "collide on the shared display."
+            )
+            self.workers = 1
 
         # Validate agent configuration early if agent is specified
         if self.agent:
@@ -126,6 +174,16 @@ class GodotBenchmarkRunner:
                 f"Agent '{self.agent}' does not support MCP. "
                 f"Set use_mcp=False or use a solver that supports MCP. "
                 f"MCP-capable solvers: {', '.join(mcp_capable)}"
+            )
+
+        # Fail fast (before any task runs) if the selected MCP server is not
+        # wired for this agent.
+        supported_mcp_servers = SolverFactory.supported_mcp_servers(self.agent)
+        if self.use_mcp and self.mcp_server not in supported_mcp_servers:
+            raise ValueError(
+                f"--mcp-server {self.mcp_server} is not supported with "
+                f"--agent {self.agent}. Supported for this agent: "
+                f"{', '.join(sorted(supported_mcp_servers))}."
             )
 
         # Provide informational message in debug mode
@@ -380,23 +438,32 @@ script = ExtResource("test_script")
             # Determine if we should use headless mode
             use_headless = not requires_display
 
-            # Import resources so fresh checkouts have generated .godot assets.
+            # Run editor to ensure project files are loaded
             cmd = [
                 self.godot_path,
-                "--import",
-                "--quit",
+                "--editor",
+                "--log-file",
+                "-",
                 "--path",
                 str(task_dir),
             ]
             if use_headless:
                 cmd.insert(1, "--headless")
 
-            subprocess.run(cmd, capture_output=True, text=True, timeout=TIMEOUT)
-            print("Imported project resources")
+            try:
+                subprocess_result = subprocess.run(
+                    cmd, capture_output=True, text=True, timeout=3
+                )
+                # TODO Move this to a script that sets up the entire repo
+                print("Loading editor to ensure project files are fully loaded")
+            except subprocess.TimeoutExpired:
+                print("Loaded")
 
             # Run test scene
             cmd = [
                 self.godot_path,
+                "--log-file",
+                "-",
                 "--path",
                 str(task_dir),
                 TEST_SCENE_NAME,
@@ -448,7 +515,9 @@ script = ExtResource("test_script")
                     "agent": self.agent,
                     "model": self.model,
                     "use_mcp": self.use_mcp,
+                    "mcp_server": self.mcp_server,
                     "use_runtime_video": self.use_runtime_video,
+                    "encourage_verification": self.encourage_verification,
                     "skip_display": self.skip_display,
                     "debug": self.debug,
                 }
@@ -469,7 +538,9 @@ script = ExtResource("test_script")
             "agent": self.agent,
             "model": self.model,
             "use_mcp": self.use_mcp,
+            "mcp_server": self.mcp_server,
             "use_runtime_video": self.use_runtime_video,
+            "encourage_verification": self.encourage_verification,
             "skip_display": self.skip_display,
             "debug": self.debug,
         }
@@ -587,7 +658,46 @@ script = ExtResource("test_script")
                 if self.debug:
                     print(f"      Warning: Could not create minimal task_config: {e}")
 
+        # Build the import cache so the agent's own headless runs work out of the
+        # box. A freshly-copied sandbox has no `.godot/` (starter projects don't
+        # ship one, and dot-dirs are skipped above), so an agent that runs
+        # `godot --headless --script verify.gd` hits missing imported assets and
+        # unresolved custom `class_name` scene roots ("scene fails to load").
+        self._build_sandbox_import_cache(sandbox_dir)
+
         return sandbox_dir
+
+    def _build_sandbox_import_cache(self, sandbox_dir: Path) -> None:
+        """Warm up a sandbox's Godot import cache (`.godot/`) in place.
+
+        Runs a one-time headless editor pass that scans the project and writes
+        the imported-asset cache plus the global script-class cache, so the
+        agent's subsequent headless runs (e.g. self-written verification
+        scripts) can load scenes/resources instead of failing on a cold cache.
+        Mirrors the warm-up ``validate_task`` performs before running the test
+        scene. Best-effort: the editor is allowed to run until the timeout and
+        then killed (the import happens during its startup scan); any
+        failure/timeout is non-fatal — the agent can still rebuild it itself.
+        """
+        cmd = [
+            self.godot_path,
+            "--headless",
+            "--editor",
+            "--quit",
+            "--path",
+            str(sandbox_dir),
+        ]
+        try:
+            subprocess.run(
+                cmd, capture_output=True, text=True, timeout=SANDBOX_IMPORT_TIMEOUT
+            )
+        except subprocess.TimeoutExpired:
+            # Expected for larger projects: the scan can outlast --quit. The
+            # cache written so far is still useful.
+            pass
+        except Exception as e:
+            if self.debug:
+                print(f"      Warning: import-cache warm-up failed: {e}")
 
     def _copy_sandbox_results_to_validation(
         self, sandbox_dir: Path, validation_dir: Path, task_dir: Path
@@ -655,24 +765,33 @@ script = ExtResource("test_script")
         use_headless = not requires_display
 
         try:
-            # Import resources so fresh checkouts have generated .godot assets.
+            # Run editor to ensure project files are loaded
             cmd = [
                 self.godot_path,
-                "--import",
-                "--quit",
+                "--editor",
+                "--log-file",
+                "-",
                 "--path",
                 str(validation_dir),
             ]
             if use_headless:
                 cmd.insert(1, "--headless")
 
-            subprocess.run(cmd, capture_output=True, text=True, timeout=TIMEOUT)
-            if self.debug:
-                print("      Imported project resources")
+            try:
+                subprocess.run(cmd, capture_output=True, text=True, timeout=3)
+                if self.debug:
+                    print(
+                        "      Loading editor to ensure project files are fully loaded"
+                    )
+            except subprocess.TimeoutExpired:
+                if self.debug:
+                    print("      Loaded")
 
             # Run test scene
             cmd = [
                 self.godot_path,
+                "--log-file",
+                "-",
                 "--path",
                 str(validation_dir),
                 TEST_SCENE_NAME,
@@ -794,7 +913,9 @@ script = ExtResource("test_script")
                 "agent": self.agent,
                 "model": self.model,
                 "use_mcp": self.use_mcp,
+                "mcp_server": self.mcp_server,
                 "use_runtime_video": self.use_runtime_video,
+                "encourage_verification": self.encourage_verification,
                 "skip_display": self.skip_display,
                 "debug": self.debug,
             }
@@ -851,6 +972,8 @@ script = ExtResource("test_script")
                     use_mcp=self.use_mcp,
                     timeout_seconds=TIMEOUT,
                     use_runtime_video=self.use_runtime_video,
+                    mcp_server=self.mcp_server,
+                    encourage_verification=self.encourage_verification,
                 )
                 solver_result = solver.solve_task()
 
@@ -918,7 +1041,7 @@ script = ExtResource("test_script")
                 shutil.copy2(log_file_path, result_subdir / "agent_trajectory.log")
 
             if self.debug:
-                print(f"✓ Benchmark cycle completed for {task_name}")
+                print(f"Benchmark cycle completed for {task_name}")
                 print(
                     f"  Results saved to: {result_subdir.relative_to(self.tasks_dir.parent)}"
                 )
@@ -944,7 +1067,9 @@ script = ExtResource("test_script")
                 "agent": self.agent,
                 "model": display_model,
                 "use_mcp": self.use_mcp,
+                "mcp_server": self.mcp_server,
                 "use_runtime_video": self.use_runtime_video,
+                "encourage_verification": self.encourage_verification,
                 "skip_display": self.skip_display,
                 "debug": self.debug,
                 "solver_success": solver_result.success if solver_result else False,
@@ -1057,6 +1182,130 @@ script = ExtResource("test_script")
             print(f"Error reading task list file: {e}")
             return []
 
+    def _build_error_result(self, task_name: str, exc: Exception) -> Dict:
+        """Build a uniform result dict for a task that raised while running."""
+        error_result = ValidationResult(False, f"Error running task: {exc}")
+        return {
+            "task_name": task_name,
+            "success": error_result.success,
+            "message": error_result.message,
+            "timestamp": error_result.timestamp,
+            "agent": self.agent,
+            "model": self.model,
+            "use_mcp": self.use_mcp,
+            "mcp_server": self.mcp_server,
+            "use_runtime_video": self.use_runtime_video,
+            "encourage_verification": self.encourage_verification,
+            "skip_display": self.skip_display,
+            "debug": self.debug,
+        }
+
+    def _record_task_result(
+        self,
+        task_result: Dict,
+        results: List[Dict],
+        completed_tasks: List[str],
+        tally: Dict,
+        is_error: bool = False,
+    ):
+        """Tally a completed task, then checkpoint progress and final results.
+
+        Shared by the sequential and parallel runners so both keep identical
+        bookkeeping and crash-safe checkpointing after every task.
+        """
+        results.append(task_result)
+        completed_tasks.append(task_result["task_name"])
+
+        if is_error:
+            tally["error"] += 1
+        elif task_result.get("skipped", False):
+            tally["skipped"] += 1
+            print(f"  → Skipped: {task_result.get('message', 'Unknown reason')}")
+        elif task_result.get("success"):
+            tally["success"] += 1
+        else:
+            tally["failure"] += 1
+
+        if task_result.get("is_rate_limited"):
+            tally["rate_limited"] = True
+
+        # Checkpoint after every task so a crash/interrupt loses at most one task.
+        self._save_progress(completed_tasks, results)
+        self._save_final_results(
+            tally["success"], tally["failure"], tally["error"], tally["skipped"],
+            results, tally["rate_limited"],
+        )
+
+    def _print_rate_limit_stop(self, completed_tasks: List[str]):
+        print("\n" + "=" * 80)
+        print("⚠️  API RATE LIMIT/QUOTA EXCEEDED - STOPPING EXECUTION")
+        print("=" * 80)
+        print(f"Completed {len(completed_tasks)} tasks before rate limit.")
+        print(f"Progress saved to: {self.progress_file}")
+        print(f"Use --resume flag to continue from where you left off.")
+        print("=" * 80 + "\n")
+
+    def _run_tasks_sequential(
+        self, tasks: List[str], results: List[Dict], completed_tasks: List[str], tally: Dict
+    ):
+        """Run tasks one at a time, stopping early on a rate-limit error."""
+        for task_name in tasks:
+            print(f"Running benchmark for task: {task_name}")
+            try:
+                task_result = self.run_benchmark(task_name)
+            except Exception as e:
+                print(f"Error running task {task_name}: {e}")
+                self._record_task_result(
+                    self._build_error_result(task_name, e),
+                    results, completed_tasks, tally, is_error=True,
+                )
+                continue
+
+            self._record_task_result(task_result, results, completed_tasks, tally)
+            if tally["rate_limited"]:
+                self._print_rate_limit_stop(completed_tasks)
+                break
+
+    def _run_tasks_parallel(
+        self, tasks: List[str], results: List[Dict], completed_tasks: List[str], tally: Dict
+    ):
+        """Run tasks across a process pool.
+
+        Processes (not threads) are required because the agent solve step does a
+        process-global os.chdir into its sandbox. On a rate-limit error we cancel
+        any not-yet-started tasks; tasks already in flight are allowed to finish
+        and `--resume` picks up whatever is left.
+        """
+        total = len(tasks)
+        with ProcessPoolExecutor(max_workers=self.workers) as executor:
+            future_to_task = {
+                executor.submit(_run_task_in_worker, self, task_name): task_name
+                for task_name in tasks
+            }
+            for future in as_completed(future_to_task):
+                task_name = future_to_task[future]
+                try:
+                    task_result = future.result()
+                    self._record_task_result(task_result, results, completed_tasks, tally)
+                    status = "PASS" if task_result.get("success") else (
+                        "skip" if task_result.get("skipped") else "fail"
+                    )
+                except Exception as e:
+                    print(f"Error running task {task_name}: {e}")
+                    self._record_task_result(
+                        self._build_error_result(task_name, e),
+                        results, completed_tasks, tally, is_error=True,
+                    )
+                    status = "error"
+
+                print(f"  [{len(completed_tasks)}/{total}] {task_name}: {status}")
+
+                if tally["rate_limited"]:
+                    self._print_rate_limit_stop(completed_tasks)
+                    for f in future_to_task:
+                        f.cancel()
+                    break
+
     def run_all_tasks(self, task_list_file: Optional[str] = None) -> Dict:
         """
         Run validation on all available tasks and generate final results summary.
@@ -1138,78 +1387,53 @@ script = ExtResource("test_script")
                         success_count, failure_count, 0, skipped_count_existing, len(results), results
                     )
 
-        success_count = sum(1 for r in results if r.get("success", False))
-        failure_count = len(results) - success_count
-        error_count = 0
-        skipped_count = 0
-        rate_limited = False
+        tally = {
+            "success": sum(1 for r in results if r.get("success", False)),
+            "failure": 0,
+            "error": 0,
+            "skipped": 0,
+            "rate_limited": False,
+        }
+        tally["failure"] = len(results) - tally["success"]
 
-        print(f"Running validation on {len(tasks)} tasks...")
-
-        for task_name in tasks:
+        # Prime any download-on-first-launch MCP server once, before dispatching
+        # workers, so parallel tasks reuse the cache instead of each fetching it
+        # (and the download isn't charged against a task's solve timeout).
+        if self.use_mcp and self.mcp_spec.prefetch:
+            print(f"Pre-fetching MCP server '{self.mcp_server}' (one-time)...")
+            warmed = self.mcp_spec.warm_up()
+            print(
+                f"  MCP server '{self.mcp_server}' ready."
+                if warmed
+                else f"  ⚠️  Could not pre-fetch '{self.mcp_server}'; "
+                "workers will fetch it on first use."
+            )
+        # Editor-plugin servers (godot-ai) also need the addon cloned+patched;
+        # do it once here so parallel workers don't race to clone the same cache.
+        if self.use_mcp and self.mcp_spec.needs_godot_editor:
             try:
-                print(f"Running benchmark for task: {task_name}")
-                task_result = self.run_benchmark(task_name)
-                results.append(task_result)
-                completed_tasks.append(task_name)
+                from gamedevbench.src.godot_ai_editor import ensure_addon
 
-                if task_result.get("skipped", False):
-                    skipped_count += 1
-                    print(f"  → Skipped: {task_result.get('message', 'Unknown reason')}")
-                elif task_result["success"]:
-                    success_count += 1
-                else:
-                    failure_count += 1
-
-                # Check if this was a rate limit error
-                if task_result.get("solver_result") and hasattr(
-                    task_result["solver_result"], "is_rate_limited"
-                ):
-                    rate_limited = task_result["solver_result"].is_rate_limited
-                elif "is_rate_limited" in task_result:
-                    rate_limited = task_result["is_rate_limited"]
-
-                # Save progress after each task
-                self._save_progress(completed_tasks, results)
-
-                # Save final results after each task (for early termination visibility)
-                self._save_final_results(success_count, failure_count, error_count, skipped_count, results, rate_limited)
-
-                # Exit early if rate limited
-                if rate_limited:
-                    print("\n" + "=" * 80)
-                    print("⚠️  API RATE LIMIT/QUOTA EXCEEDED - STOPPING EXECUTION")
-                    print("=" * 80)
-                    print(f"Completed {len(completed_tasks)} tasks before rate limit.")
-                    print(f"Progress saved to: {self.progress_file}")
-                    print(f"Use --resume flag to continue from where you left off.")
-                    print("=" * 80 + "\n")
-                    break
-
+                ensure_addon()
+                print(f"  MCP server '{self.mcp_server}' addon cached.")
             except Exception as e:
-                error_count += 1
-                error_result = ValidationResult(False, f"Error running task: {e}")
-                task_result = {
-                    "task_name": task_name,
-                    "success": error_result.success,
-                    "message": error_result.message,
-                    "timestamp": error_result.timestamp,
-                    "agent": self.agent,
-                    "model": self.model,
-                    "use_mcp": self.use_mcp,
-                    "use_runtime_video": self.use_runtime_video,
-                    "skip_display": self.skip_display,
-                    "debug": self.debug,
-                }
-                results.append(task_result)
-                completed_tasks.append(task_name)
-                print(f"Error running task {task_name}: {e}")
+                print(
+                    f"  ⚠️  Could not pre-fetch '{self.mcp_server}' addon ({e}); "
+                    "workers will fetch it on first use."
+                )
 
-                # Save progress even on error
-                self._save_progress(completed_tasks, results)
+        if self.workers > 1 and len(tasks) > 1:
+            print(f"Running {len(tasks)} tasks with {self.workers} parallel workers...")
+            self._run_tasks_parallel(tasks, results, completed_tasks, tally)
+        else:
+            print(f"Running validation on {len(tasks)} tasks...")
+            self._run_tasks_sequential(tasks, results, completed_tasks, tally)
 
-                # Save final results after error
-                self._save_final_results(success_count, failure_count, error_count, skipped_count, results, rate_limited)
+        success_count = tally["success"]
+        failure_count = tally["failure"]
+        error_count = tally["error"]
+        skipped_count = tally["skipped"]
+        rate_limited = tally["rate_limited"]
 
         total_tasks = len(results)
         final_results = self._create_final_results_summary(
@@ -1323,7 +1547,9 @@ script = ExtResource("test_script")
                 "agent": self.agent,
                 "model": self.model,
                 "use_mcp": self.use_mcp,
+                "mcp_server": self.mcp_server,
                 "use_runtime_video": self.use_runtime_video,
+                "encourage_verification": self.encourage_verification,
                 "skip_display": self.skip_display,
                 "debug": self.debug,
                 "run_name": self.run_name,
@@ -1364,7 +1590,9 @@ script = ExtResource("test_script")
             "agent",
             "model",
             "use_mcp",
+            "mcp_server",
             "use_runtime_video",
+            "encourage_verification",
             "skip_display",
             "debug",
             "solver_success",
@@ -1393,7 +1621,11 @@ script = ExtResource("test_script")
                     "agent": result.get("agent", ""),
                     "model": result.get("model", ""),
                     "use_mcp": result.get("use_mcp", False),
+                    "mcp_server": result.get("mcp_server", DEFAULT_MCP_SERVER),
                     "use_runtime_video": result.get("use_runtime_video", False),
+                    "encourage_verification": result.get(
+                        "encourage_verification", False
+                    ),
                     "skip_display": result.get("skip_display", False),
                     "debug": result.get("debug", False),
                     "solver_success": result.get("solver_success", False),
@@ -1422,7 +1654,7 @@ def main():
     parser.add_argument(
         "--model",
         default="claude",
-        help="Model to use (for claude-code: model name; for mini-swe: 'claude' or 'gpt'; for openhands: model name like 'gpt-4o'; for gemini-cli: model name like 'gemini-2.0-flash'; for opencode: provider/model)",
+        help="Model to use (for claude-code: model name; for mini-swe: 'claude' or 'gpt'; for openhands: model name like 'gpt-4o'; for gemini-cli: model name like 'gemini-2.0-flash'; ignored for codex)",
     )
     parser.add_argument("--debug", help="Show debug output", action="store_true")
     parser.add_argument(
@@ -1441,6 +1673,15 @@ def main():
         action="store_true",
     )
     parser.add_argument(
+        "--mcp-server",
+        choices=available_mcp_servers(),
+        default=DEFAULT_MCP_SERVER,
+        help="Which MCP server to wire in when --enable-mcp is set "
+        f"(default: {DEFAULT_MCP_SERVER}). A non-default server (e.g. 'godot', "
+        "the @coding-solo/godot-mcp server) is currently honored only by "
+        "--agent openhands.",
+    )
+    parser.add_argument(
         "--skip-display",
         help="Skip tasks that require display (requires_display=true in task_config.json)",
         action="store_true",
@@ -1451,9 +1692,22 @@ def main():
         action="store_true",
     )
     parser.add_argument(
+        "--encourage-verification",
+        help="Append a light nudge asking the agent to write & run its own "
+        "behavioral tests against the spec before finishing (OpenHands only).",
+        action="store_true",
+    )
+    parser.add_argument(
         "--run-name",
         help="Optional name used to isolate outputs under results/<run_name>/ and tasks/test_result/<run_name>/",
         type=str,
+    )
+    parser.add_argument(
+        "--workers",
+        help="Number of tasks to run concurrently for `run` over a task list "
+        "(each in its own process). Default 8; forced to 1 when --enable-mcp is set.",
+        type=int,
+        default=8,
     )
     subparsers = parser.add_subparsers(dest="command", help="Available commands")
 
@@ -1499,6 +1753,9 @@ def main():
         skip_display=args.skip_display,
         use_runtime_video=args.use_runtime_video,
         run_name=args.run_name,
+        workers=args.workers,
+        mcp_server=args.mcp_server,
+        encourage_verification=args.encourage_verification,
     )
 
     if args.command == "list":

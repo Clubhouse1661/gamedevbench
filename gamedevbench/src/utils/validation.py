@@ -69,7 +69,7 @@ class ValidationParser:
             results_dir = PROJECT_ROOT / "results"
         
         # Create results directory if it doesn't exist
-        results_dir.mkdir(exist_ok=True)
+        results_dir.mkdir(parents=True, exist_ok=True)
         
         # Create filename based on task name
         filename = f"task_{task_name}.json"

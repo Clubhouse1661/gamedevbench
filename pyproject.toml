@@ -9,6 +9,7 @@ description = "A benchmark suite for game development tasks in Godot"
 requires-python = ">=3.10"
 dependencies = [
     "mcp",
+    "fastmcp",
     "pyautogui",
     "claude-agent-sdk",
     "pillow",
