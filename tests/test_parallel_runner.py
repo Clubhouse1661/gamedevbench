@@ -10,6 +10,7 @@ import yaml
 import gamedevbench.src.benchmark_runner as br
 import gamedevbench.src.godot_ai_editor as gae
 from gamedevbench.src.benchmark_runner import GodotBenchmarkRunner
+from gamedevbench.src.utils.data_types import SolverResult
 
 
 class _FakeProcess:
@@ -217,6 +218,32 @@ def test_reap_task_run_artifacts_removes_temp_dirs_and_servers(tmp_path, monkeyp
     assert not gai_dir.exists()
     assert not codex_dir.exists()
     assert unrelated.exists()
+
+
+def test_solver_log_writes_unicode_output(tmp_path):
+    runner = _make_runner(tmp_path)
+    runner.agent = "codex"
+    log_path = tmp_path / "agent_trajectory.log"
+    solver_result = SolverResult(
+        success=True,
+        message="finished → validated",
+        duration_seconds=1.25,
+        stdout="tool output → ok",
+        stderr="warning ✓",
+    )
+
+    runner._write_solver_log(
+        log_path,
+        "task_unicode",
+        "gpt-5.5",
+        tmp_path,
+        solver_result,
+    )
+
+    text = log_path.read_text(encoding="utf-8")
+    assert "finished → validated" in text
+    assert "tool output → ok" in text
+    assert "warning ✓" in text
 
 
 def test_single_worker_uses_sequential_path(tmp_path, monkeypatch):

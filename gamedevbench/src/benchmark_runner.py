@@ -315,7 +315,7 @@ class GodotBenchmarkRunner:
             "results": results,
             "timestamp": datetime.now().isoformat(),
         }
-        with open(self.progress_file, "w") as f:
+        with open(self.progress_file, "w", encoding="utf-8") as f:
             json.dump(progress_data, f, indent=2)
         if self.debug:
             print(f"Progress saved to: {self.progress_file}")
@@ -326,7 +326,7 @@ class GodotBenchmarkRunner:
             return [], []
 
         try:
-            with open(self.progress_file, "r") as f:
+            with open(self.progress_file, "r", encoding="utf-8") as f:
                 progress_data = json.load(f)
             completed_tasks = progress_data.get("completed_tasks", [])
             results = progress_data.get("results", [])
@@ -358,7 +358,7 @@ class GodotBenchmarkRunner:
             return [], [], []
 
         try:
-            with open(results_path, "r") as f:
+            with open(results_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
 
             tasks_to_skip = []
@@ -401,7 +401,7 @@ class GodotBenchmarkRunner:
         config_path = self.tasks_dir / task_name / "task_config.json"
 
         try:
-            with open(config_path, "r") as f:
+            with open(config_path, "r", encoding="utf-8") as f:
                 return json.load(f)
         except Exception as e:
             print(f"Error loading config for task {task_name}: {e}")
@@ -456,7 +456,7 @@ class GodotBenchmarkRunner:
                 print(f"Main scene not found: {main_scene_path}")
                 return False
 
-            with open(main_scene_path, "r") as f:
+            with open(main_scene_path, "r", encoding="utf-8") as f:
                 main_content = f.read()
 
             # Create validation scene content by adding test node
@@ -503,7 +503,7 @@ script = ExtResource("test_script")
 
             # Write the validation scene
             validation_scene_path = task_dir / "scenes" / "validation_scene.tscn"
-            with open(validation_scene_path, "w") as f:
+            with open(validation_scene_path, "w", encoding="utf-8") as f:
                 f.write(validation_content)
 
             return True
@@ -747,7 +747,7 @@ script = ExtResource("test_script")
         task_config_src = task_dir / "task_config.json"
         if task_config_src.exists():
             try:
-                with open(task_config_src, "r") as f:
+                with open(task_config_src, "r", encoding="utf-8") as f:
                     full_config = json.load(f)
                 # Only include instruction field - nothing else that could help cheat
                 minimal_config = {
@@ -755,7 +755,7 @@ script = ExtResource("test_script")
                         "instruction", "No instruction provided"
                     )
                 }
-                with open(sandbox_dir / "task_config.json", "w") as f:
+                with open(sandbox_dir / "task_config.json", "w", encoding="utf-8") as f:
                     json.dump(minimal_config, f, indent=2)
             except Exception as e:
                 if self.debug:
@@ -984,10 +984,34 @@ script = ExtResource("test_script")
 
             # Write to result.json
             result_json_path = result_subdir / "result.json"
-            with open(result_json_path, "w") as f:
+            with open(result_json_path, "w", encoding="utf-8") as f:
                 json.dump(result_json, f, indent=2)
 
         return result_subdir
+
+    def _write_solver_log(
+        self,
+        log_file_path: Path,
+        task_name: str,
+        display_model: str,
+        sandbox_dir: Path,
+        solver_result,
+    ) -> None:
+        with open(log_file_path, "w", encoding="utf-8") as f:
+            f.write(f"Task: {task_name}\n")
+            f.write(f"Agent: {self.agent}\n")
+            f.write(f"Model: {display_model}\n")
+            f.write(f"Sandbox: {sandbox_dir}\n")
+            f.write(f"Timestamp: {datetime.now().isoformat()}\n")
+            f.write("=" * 80 + "\n\n")
+            if solver_result:
+                f.write(f"Success: {solver_result.success}\n")
+                f.write(f"Message: {solver_result.message}\n")
+                f.write(f"Duration: {solver_result.duration_seconds:.2f}s\n\n")
+                f.write("STDOUT:\n")
+                f.write(solver_result.stdout or "")
+                f.write("\n\nSTDERR:\n")
+                f.write(solver_result.stderr or "")
 
     def _run_benchmark_with_agent(self, task_name: str) -> Dict:
         """
@@ -1081,21 +1105,13 @@ script = ExtResource("test_script")
                 solver_result = solver.solve_task()
 
                 # Save solver output to log file
-                with open(log_file_path, "w") as f:
-                    f.write(f"Task: {task_name}\n")
-                    f.write(f"Agent: {self.agent}\n")
-                    f.write(f"Model: {display_model}\n")
-                    f.write(f"Sandbox: {sandbox_dir}\n")
-                    f.write(f"Timestamp: {datetime.now().isoformat()}\n")
-                    f.write("=" * 80 + "\n\n")
-                    if solver_result:
-                        f.write(f"Success: {solver_result.success}\n")
-                        f.write(f"Message: {solver_result.message}\n")
-                        f.write(f"Duration: {solver_result.duration_seconds:.2f}s\n\n")
-                        f.write("STDOUT:\n")
-                        f.write(solver_result.stdout or "")
-                        f.write("\n\nSTDERR:\n")
-                        f.write(solver_result.stderr or "")
+                self._write_solver_log(
+                    log_file_path,
+                    task_name,
+                    display_model,
+                    sandbox_dir,
+                    solver_result,
+                )
 
                 if self.debug:
                     print(
@@ -1239,14 +1255,14 @@ script = ExtResource("test_script")
         # Save final results to JSON
         self.results_dir.mkdir(parents=True, exist_ok=True)
         final_results_path = self.results_dir / "final_results.json"
-        with open(final_results_path, "w") as f:
+        with open(final_results_path, "w", encoding="utf-8") as f:
             json.dump(final_results, f, indent=2)
 
         # Also save to agent-model-specific file if agent is specified
         if self.agent:
             safe_model = self.model.replace("/", "_") if self.model else "default"
             agent_model_results_path = self.results_dir / f"{self.agent}_{safe_model}_final_results.json"
-            with open(agent_model_results_path, "w") as f:
+            with open(agent_model_results_path, "w", encoding="utf-8") as f:
                 json.dump(final_results, f, indent=2)
 
         # Save results to CSV
@@ -1656,14 +1672,14 @@ script = ExtResource("test_script")
         # Save final results to JSON
         self.results_dir.mkdir(parents=True, exist_ok=True)
         final_results_path = self.results_dir / "final_results.json"
-        with open(final_results_path, "w") as f:
+        with open(final_results_path, "w", encoding="utf-8") as f:
             json.dump(final_results, f, indent=2)
 
         # Also save to agent-model-specific file if agent is specified
         if self.agent:
             safe_model = self.model.replace("/", "_") if self.model else "default"
             agent_model_results_path = self.results_dir / f"{self.agent}_{safe_model}_final_results.json"
-            with open(agent_model_results_path, "w") as f:
+            with open(agent_model_results_path, "w", encoding="utf-8") as f:
                 json.dump(final_results, f, indent=2)
 
         # Save results to CSV
@@ -1813,7 +1829,7 @@ script = ExtResource("test_script")
             "result_dir",
         ]
 
-        with open(csv_path, "w", newline="") as csvfile:
+        with open(csv_path, "w", newline="", encoding="utf-8") as csvfile:
             writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
             writer.writeheader()
 
