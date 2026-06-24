@@ -575,7 +575,9 @@ class GodotAiEditorSession:
         for attempt in range(1, self.max_attempts + 1):
             http, ws = free_port(), free_port()
             url = f"http://127.0.0.1:{http}/mcp"
-            isolated = Path(tempfile.mkdtemp(prefix="gamedevbench_gai_"))
+            run_id = os.environ.get("GAMEDEVBENCH_TASK_RUN_ID")
+            prefix = f"gamedevbench_gai_{run_id}_" if run_id else "gamedevbench_gai_"
+            isolated = Path(tempfile.mkdtemp(prefix=prefix))
             (isolated / "config").mkdir()
             (isolated / "data").mkdir()
 

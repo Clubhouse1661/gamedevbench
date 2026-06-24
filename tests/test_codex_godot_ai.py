@@ -57,6 +57,10 @@ def _completed_codex():
     )
 
 
+def _patch_codex_command(monkeypatch, func):
+    monkeypatch.setattr(CodexSolver, "_run_codex_command", func)
+
+
 def test_codex_command_prefers_windows_cmd_wrapper(monkeypatch):
     seen = []
 
@@ -90,15 +94,15 @@ def test_godot_ai_writes_task_local_http_config_and_runs_editor(
     _patch_editor(monkeypatch)
     captured = {}
 
-    def fake_run(cmd, **kwargs):
-        codex_home = Path(kwargs["env"]["CODEX_HOME"])
+    def fake_command(self, cmd, *, cwd, env):
+        codex_home = Path(env["CODEX_HOME"])
         captured["cmd"] = cmd
-        captured["env"] = kwargs["env"]
+        captured["env"] = env
         captured["codex_home"] = codex_home
         captured["config"] = (codex_home / "config.toml").read_text()
         return _completed_codex()
 
-    monkeypatch.setattr(codex.subprocess, "run", fake_run)
+    _patch_codex_command(monkeypatch, fake_command)
     solver = _make_solver(use_mcp=True, mcp_server="godot-ai")
 
     result = solver.solve_task()
@@ -116,22 +120,78 @@ def test_godot_ai_writes_task_local_http_config_and_runs_editor(
     assert "enabled = true" in captured["config"]
 
 
-def test_codex_subprocess_decodes_utf8_with_replacement(monkeypatch, tmp_path):
+def test_codex_subprocess_decodes_utf8_with_replacement(monkeypatch):
+    captured = {}
+
+    class FakePopen:
+        pid = 123
+        returncode = 0
+
+        def __init__(self, cmd, **kwargs):
+            captured.update(kwargs)
+
+        def communicate(self, timeout=None):
+            return ('{"type":"turn.completed","finalResponse":"done"}\n', "")
+
+    monkeypatch.setattr(codex.subprocess, "Popen", FakePopen)
+    solver = _make_solver()
+
+    result = solver._run_codex_command(["codex"], cwd=".", env=None)
+
+    assert result.returncode == 0
+    assert captured["encoding"] == "utf-8"
+    assert captured["errors"] == "replace"
+
+
+def test_codex_timeout_kills_subprocess_tree(monkeypatch):
+    killed = []
+
+    class FakePopen:
+        pid = 321
+        returncode = None
+
+        def __init__(self, cmd, **kwargs):
+            pass
+
+        def communicate(self, timeout=None):
+            if timeout == 5:
+                return "", ""
+            raise subprocess.TimeoutExpired(cmd=["codex"], timeout=timeout)
+
+    monkeypatch.setattr(codex.subprocess, "Popen", FakePopen)
+    monkeypatch.setattr(
+        codex,
+        "terminate_process_tree",
+        lambda pid, **kwargs: killed.append((pid, kwargs)),
+    )
+    solver = _make_solver()
+
+    try:
+        solver._run_codex_command(["codex"], cwd=".", env=None)
+    except subprocess.TimeoutExpired:
+        pass
+    else:  # pragma: no cover - defensive
+        raise AssertionError("expected timeout")
+
+    assert killed == [(321, {"kill_process_group": codex.os.name != "nt"})]
+
+
+def test_codex_solver_uses_command_wrapper(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
     captured = {}
 
-    def fake_run(cmd, **kwargs):
-        captured.update(kwargs)
+    def fake_command(self, cmd, *, cwd, env):
+        captured["cwd"] = cwd
+        captured["env"] = env
         return _completed_codex()
 
-    monkeypatch.setattr(codex.subprocess, "run", fake_run)
+    _patch_codex_command(monkeypatch, fake_command)
     solver = _make_solver()
 
     result = solver.solve_task()
 
     assert result.success is True
-    assert captured["encoding"] == "utf-8"
-    assert captured["errors"] == "replace"
+    assert captured["cwd"] == str(tmp_path)
 
 
 def test_godot_ai_editor_and_codex_home_are_cleaned_up_on_timeout(
@@ -142,12 +202,12 @@ def test_godot_ai_editor_and_codex_home_are_cleaned_up_on_timeout(
     _patch_editor(monkeypatch)
     captured = {}
 
-    def fake_run(cmd, **kwargs):
-        codex_home = Path(kwargs["env"]["CODEX_HOME"])
+    def fake_command(self, cmd, *, cwd, env):
+        codex_home = Path(env["CODEX_HOME"])
         captured["codex_home"] = codex_home
         raise subprocess.TimeoutExpired(cmd=cmd, timeout=30)
 
-    monkeypatch.setattr(codex.subprocess, "run", fake_run)
+    _patch_codex_command(monkeypatch, fake_command)
     solver = _make_solver(use_mcp=True, mcp_server="godot-ai")
 
     result = solver.solve_task()
@@ -165,13 +225,13 @@ def test_screenshot_mcp_uses_isolated_codex_home_without_godot_ai(
     monkeypatch.setenv("CODEX_API_KEY", "test-key")
     captured = {}
 
-    def fake_run(cmd, **kwargs):
-        codex_home = Path(kwargs["env"]["CODEX_HOME"])
+    def fake_command(self, cmd, *, cwd, env):
+        codex_home = Path(env["CODEX_HOME"])
         captured["codex_home"] = codex_home
         captured["config"] = (codex_home / "config.toml").read_text()
         return _completed_codex()
 
-    monkeypatch.setattr(codex.subprocess, "run", fake_run)
+    _patch_codex_command(monkeypatch, fake_command)
     solver = _make_solver(use_mcp=True)
 
     result = solver.solve_task()
@@ -190,8 +250,8 @@ def test_parallel_godot_ai_runs_use_isolated_codex_homes_and_urls(
     _patch_editor(monkeypatch)
     captures = []
 
-    def fake_run(cmd, **kwargs):
-        codex_home = Path(kwargs["env"]["CODEX_HOME"])
+    def fake_command(self, cmd, *, cwd, env):
+        codex_home = Path(env["CODEX_HOME"])
         captures.append(
             {
                 "codex_home": codex_home,
@@ -200,7 +260,7 @@ def test_parallel_godot_ai_runs_use_isolated_codex_homes_and_urls(
         )
         return _completed_codex()
 
-    monkeypatch.setattr(codex.subprocess, "run", fake_run)
+    _patch_codex_command(monkeypatch, fake_command)
 
     def run_one():
         return _make_solver(use_mcp=True, mcp_server="godot-ai").solve_task()

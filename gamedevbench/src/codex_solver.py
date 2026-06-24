@@ -17,6 +17,7 @@ from gamedevbench.src.base_solver import BaseSolver
 from gamedevbench.src.godot_ai_lifecycle import maybe_godot_ai_editor_session
 from gamedevbench.src.mcp_registry import DEFAULT_MCP_SERVER, get_mcp_server
 from gamedevbench.src.utils.data_types import SolverResult, TokenUsage
+from gamedevbench.src.utils.process_tree import terminate_process_tree
 
 
 class CodexSolver(BaseSolver):
@@ -130,7 +131,9 @@ class CodexSolver(BaseSolver):
 
     def _prepare_codex_home(self, http_url: str = "") -> tempfile.TemporaryDirectory:
         """Create a per-task Codex home containing only benchmark MCP config."""
-        temp_home = tempfile.TemporaryDirectory(prefix="gamedevbench_codex_")
+        run_id = os.environ.get("GAMEDEVBENCH_TASK_RUN_ID")
+        prefix = f"gamedevbench_codex_{run_id}_" if run_id else "gamedevbench_codex_"
+        temp_home = tempfile.TemporaryDirectory(prefix=prefix)
         codex_home = Path(temp_home.name)
         config = self._build_codex_mcp_config(self.mcp_server, http_url=http_url)
         (codex_home / "config.toml").write_text(config, encoding="utf-8")
@@ -153,6 +156,40 @@ class CodexSolver(BaseSolver):
                 if resolved:
                     return resolved
         return shutil.which("codex") or "codex"
+
+    def _run_codex_command(
+        self, cmd: list[str], *, cwd: str, env: Optional[dict[str, str]]
+    ) -> subprocess.CompletedProcess:
+        """Run Codex with a timeout that kills its whole child process tree."""
+        popen_kwargs = {
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.PIPE,
+            "text": True,
+            "encoding": "utf-8",
+            "errors": "replace",
+            "cwd": cwd,
+            "env": env,
+        }
+        if os.name != "nt":
+            popen_kwargs["start_new_session"] = True
+        proc = subprocess.Popen(cmd, **popen_kwargs)
+        try:
+            stdout, stderr = proc.communicate(timeout=self.timeout_seconds)
+        except subprocess.TimeoutExpired as exc:
+            terminate_process_tree(
+                proc.pid, kill_process_group=(os.name != "nt")
+            )
+            try:
+                stdout, stderr = proc.communicate(timeout=5)
+            except Exception:
+                stdout, stderr = "", ""
+            exc.output = stdout
+            exc.stderr = stderr
+            raise exc
+
+        return subprocess.CompletedProcess(
+            cmd, proc.returncode, stdout=stdout, stderr=stderr
+        )
 
     @staticmethod
     def _coerce_int(value: Any) -> int:
@@ -283,14 +320,11 @@ class CodexSolver(BaseSolver):
                     print("\nCODEX TRAJECTORY:")
                     print("=" * 60)
 
-                # Run Codex
-                result = subprocess.run(
+                # Run Codex. On timeout, reap the whole process tree (Codex,
+                # MCP servers, and any Godot children) before returning control
+                # to the benchmark worker.
+                result = self._run_codex_command(
                     cmd,
-                    capture_output=True,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    timeout=self.timeout_seconds,
                     cwd=os.getcwd(),
                     env=codex_env,
                 )

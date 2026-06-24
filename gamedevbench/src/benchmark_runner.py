@@ -10,7 +10,9 @@ import re
 import yaml
 import tempfile
 import uuid
-from concurrent.futures import ProcessPoolExecutor, as_completed
+import multiprocessing as mp
+import queue
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -29,15 +31,20 @@ from gamedevbench.src.utils.constants import (
     RESULTS_FOLDER,
     TIMEOUT,
     SANDBOX_IMPORT_TIMEOUT,
+    HARD_CAP_GRACE,
 )
 from gamedevbench.src.utils.data_types import ValidationResult
 from gamedevbench.src.utils.validation import ValidationParser
+from gamedevbench.src.utils.process_tree import terminate_process_tree
 from gamedevbench.src.solver_factory import SolverFactory
 from gamedevbench.src.mcp_registry import (
     DEFAULT_MCP_SERVER,
     available_mcp_servers,
     get_mcp_server,
 )
+
+
+_TASK_RUN_ID_ENV = "GAMEDEVBENCH_TASK_RUN_ID"
 
 
 def _run_task_in_worker(runner: "GodotBenchmarkRunner", task_name: str) -> Dict:
@@ -48,6 +55,79 @@ def _run_task_in_worker(runner: "GodotBenchmarkRunner", task_name: str) -> Dict:
     solver's os.chdir into the sandbox isolated from sibling tasks.
     """
     return runner.run_benchmark(task_name)
+
+
+def _run_task_process_entry(
+    runner: "GodotBenchmarkRunner",
+    task_name: str,
+    result_queue,
+    run_id: str,
+) -> None:
+    """Run one task in a child process and send a serializable result."""
+    previous_run_id = os.environ.get(_TASK_RUN_ID_ENV)
+    os.environ[_TASK_RUN_ID_ENV] = run_id
+    try:
+        result_queue.put(
+            {
+                "kind": "result",
+                "task_name": task_name,
+                "result": _run_task_in_worker(runner, task_name),
+            }
+        )
+    except BaseException as exc:
+        result_queue.put(
+            {
+                "kind": "error",
+                "task_name": task_name,
+                "error": repr(exc),
+            }
+        )
+    finally:
+        if previous_run_id is None:
+            os.environ.pop(_TASK_RUN_ID_ENV, None)
+        else:
+            os.environ[_TASK_RUN_ID_ENV] = previous_run_id
+
+
+def _start_task_process(
+    ctx: mp.context.BaseContext,
+    runner: "GodotBenchmarkRunner",
+    task_name: str,
+    run_id: str,
+):
+    result_queue = ctx.Queue()
+    proc = ctx.Process(
+        target=_run_task_process_entry,
+        args=(runner, task_name, result_queue, run_id),
+        name=f"gamedevbench-{task_name}",
+    )
+    proc.start()
+    return proc, result_queue
+
+
+def _reap_task_run_artifacts(run_id: str) -> None:
+    """Remove temp dirs and detached godot-ai servers for a killed task."""
+    try:
+        from gamedevbench.src.godot_ai_editor import _reap_servers
+    except Exception:
+        _reap_servers = None
+
+    temp_root = Path(tempfile.gettempdir())
+    prefixes = (
+        f"gamedevbench_gai_{run_id}_",
+        f"gamedevbench_codex_{run_id}_",
+        f"gamedevbench_sandbox_{run_id}_",
+        f"gamedevbench_validation_{run_id}_",
+    )
+    for child in temp_root.iterdir():
+        if not any(child.name.startswith(prefix) for prefix in prefixes):
+            continue
+        if _reap_servers and child.name.startswith(f"gamedevbench_gai_{run_id}_"):
+            try:
+                _reap_servers(child)
+            except Exception:
+                pass
+        shutil.rmtree(child, ignore_errors=True)
 
 
 class GodotBenchmarkRunner:
@@ -122,6 +202,14 @@ class GodotBenchmarkRunner:
         self.use_runtime_video = use_runtime_video
         self.encourage_verification = encourage_verification
         self.workers = max(1, int(workers))
+        self.worker_hard_timeout_seconds = float(
+            os.environ.get(
+                "GAMEDEVBENCH_WORKER_HARD_TIMEOUT_SECONDS",
+                # Solver + validation can each legitimately consume TIMEOUT.
+                # This is only a parent-owned backstop for wedged workers.
+                TIMEOUT + SANDBOX_IMPORT_TIMEOUT + TIMEOUT + HARD_CAP_GRACE,
+            )
+        )
 
         # Only MCP servers that grab a host-global resource force sequential
         # runs: the screenshot baseline captures a whole monitor. Headless stdio
@@ -562,7 +650,9 @@ script = ExtResource("test_script")
             Path to the sandbox directory in /tmp
         """
         # Create unique sandbox directory in /tmp
-        sandbox_id = f"gamedevbench_sandbox_{uuid.uuid4().hex[:8]}"
+        run_id = os.environ.get(_TASK_RUN_ID_ENV)
+        id_suffix = f"{run_id}_{uuid.uuid4().hex[:8]}" if run_id else uuid.uuid4().hex[:8]
+        sandbox_id = f"gamedevbench_sandbox_{id_suffix}"
         sandbox_dir = Path(tempfile.gettempdir()) / sandbox_id
         sandbox_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1015,7 +1105,9 @@ script = ExtResource("test_script")
             # Step 3: Create validation directory with agent's work + test files
             if self.debug:
                 print(f"[3/5] Preparing validation environment...")
-            validation_id = f"gamedevbench_validation_{uuid.uuid4().hex[:8]}"
+            run_id = os.environ.get(_TASK_RUN_ID_ENV)
+            id_suffix = f"{run_id}_{uuid.uuid4().hex[:8]}" if run_id else uuid.uuid4().hex[:8]
+            validation_id = f"gamedevbench_validation_{id_suffix}"
             validation_dir = Path(tempfile.gettempdir()) / validation_id
             validation_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1200,6 +1292,36 @@ script = ExtResource("test_script")
             "debug": self.debug,
         }
 
+    def _build_timeout_result(self, task_name: str, timeout_seconds: float) -> Dict:
+        """Build a result for a task worker killed by the parent hard cap."""
+        result = ValidationResult(
+            False,
+            f"Task worker exceeded {timeout_seconds:.1f}s hard cap and was killed",
+        )
+        return {
+            "task_name": task_name,
+            "success": False,
+            "message": result.message,
+            "timestamp": result.timestamp,
+            "agent": self.agent,
+            "model": self.model,
+            "use_mcp": self.use_mcp,
+            "mcp_server": self.mcp_server,
+            "use_runtime_video": self.use_runtime_video,
+            "encourage_verification": self.encourage_verification,
+            "skip_display": self.skip_display,
+            "debug": self.debug,
+            "solver_success": False,
+            "solver_message": result.message,
+            "solver_duration": timeout_seconds,
+            "is_rate_limited": False,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "total_tokens": 0,
+            "cost_usd": 0.0,
+            "timed_out": True,
+        }
+
     def _record_task_result(
         self,
         task_result: Dict,
@@ -1269,42 +1391,112 @@ script = ExtResource("test_script")
     def _run_tasks_parallel(
         self, tasks: List[str], results: List[Dict], completed_tasks: List[str], tally: Dict
     ):
-        """Run tasks across a process pool.
+        """Run tasks in parent-owned processes with hard timeout/reap.
 
-        Processes (not threads) are required because the agent solve step does a
-        process-global os.chdir into its sandbox. On a rate-limit error we cancel
-        any not-yet-started tasks; tasks already in flight are allowed to finish
-        and `--resume` picks up whatever is left.
+        ``ProcessPoolExecutor`` cannot kill a task that is already running. A
+        wedged solver therefore held the whole pool open indefinitely. This
+        scheduler owns each worker PID, so a hard-capped task can be marked
+        timed out, its process tree and temp editor dirs reaped, and the batch
+        can continue.
         """
         total = len(tasks)
-        with ProcessPoolExecutor(max_workers=self.workers) as executor:
-            future_to_task = {
-                executor.submit(_run_task_in_worker, self, task_name): task_name
-                for task_name in tasks
+        pending = list(tasks)
+        active: Dict[str, Dict] = {}
+        ctx = mp.get_context()
+
+        def start_next() -> None:
+            task_name = pending.pop(0)
+            run_id = uuid.uuid4().hex[:12]
+            proc, proc_queue = _start_task_process(ctx, self, task_name, run_id)
+            active[run_id] = {
+                "task_name": task_name,
+                "process": proc,
+                "queue": proc_queue,
+                "deadline": time.monotonic() + self.worker_hard_timeout_seconds,
             }
-            for future in as_completed(future_to_task):
-                task_name = future_to_task[future]
+            print(f"Running benchmark for task: {task_name}")
+
+        def record_result(task_name: str, task_result: Dict, *, is_error: bool = False) -> None:
+            self._record_task_result(task_result, results, completed_tasks, tally, is_error=is_error)
+            status = "error" if is_error else (
+                "PASS" if task_result.get("success") else (
+                    "skip" if task_result.get("skipped") else "fail"
+                )
+            )
+            if task_result.get("timed_out"):
+                status = "timeout"
+            print(f"  [{len(completed_tasks)}/{total}] {task_name}: {status}")
+
+        while pending or active:
+            while pending and len(active) < self.workers and not tally["rate_limited"]:
+                start_next()
+
+            progressed = False
+            now = time.monotonic()
+            for run_id, slot in list(active.items()):
+                task_name = slot["task_name"]
+                proc = slot["process"]
+                proc_queue = slot["queue"]
+
                 try:
-                    task_result = future.result()
-                    self._record_task_result(task_result, results, completed_tasks, tally)
-                    status = "PASS" if task_result.get("success") else (
-                        "skip" if task_result.get("skipped") else "fail"
-                    )
-                except Exception as e:
-                    print(f"Error running task {task_name}: {e}")
-                    self._record_task_result(
-                        self._build_error_result(task_name, e),
-                        results, completed_tasks, tally, is_error=True,
-                    )
-                    status = "error"
+                    payload = proc_queue.get_nowait()
+                except queue.Empty:
+                    payload = None
 
-                print(f"  [{len(completed_tasks)}/{total}] {task_name}: {status}")
+                if payload is not None:
+                    proc.join(timeout=1)
+                    active.pop(run_id, None)
+                    progressed = True
+                    if payload.get("kind") == "result":
+                        record_result(task_name, payload["result"])
+                    else:
+                        message = payload.get("error", "unknown worker error")
+                        print(f"Error running task {task_name}: {message}")
+                        record_result(
+                            task_name,
+                            self._build_error_result(task_name, RuntimeError(message)),
+                            is_error=True,
+                        )
+                    _reap_task_run_artifacts(run_id)
+                    if tally["rate_limited"]:
+                        pending.clear()
+                        self._print_rate_limit_stop(completed_tasks)
+                    continue
 
-                if tally["rate_limited"]:
-                    self._print_rate_limit_stop(completed_tasks)
-                    for f in future_to_task:
-                        f.cancel()
-                    break
+                if not proc.is_alive():
+                    proc.join(timeout=1)
+                    active.pop(run_id, None)
+                    progressed = True
+                    message = f"worker exited with code {proc.exitcode} without a result"
+                    print(f"Error running task {task_name}: {message}")
+                    record_result(
+                        task_name,
+                        self._build_error_result(task_name, RuntimeError(message)),
+                        is_error=True,
+                    )
+                    _reap_task_run_artifacts(run_id)
+                    continue
+
+                if now >= slot["deadline"]:
+                    active.pop(run_id, None)
+                    progressed = True
+                    print(
+                        f"Task {task_name} exceeded "
+                        f"{self.worker_hard_timeout_seconds:.1f}s; killing worker tree"
+                    )
+                    terminate_process_tree(proc.pid)
+                    proc.join(timeout=5)
+                    _reap_task_run_artifacts(run_id)
+                    record_result(
+                        task_name,
+                        self._build_timeout_result(
+                            task_name, self.worker_hard_timeout_seconds
+                        ),
+                        is_error=True,
+                    )
+
+            if not progressed and (pending or active):
+                time.sleep(0.2)
 
     def run_all_tasks(self, task_list_file: Optional[str] = None) -> Dict:
         """

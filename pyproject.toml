@@ -15,6 +15,7 @@ dependencies = [
     "openhands-sdk; python_version >= '3.12'",
     "openhands-tools; python_version >= '3.12'",
     "mss>=10.2.0",
+    "psutil",
     "pyyaml",
     "python-dotenv",
 ]

@@ -1,37 +1,43 @@
 """Tests for the parallel (multi-worker) benchmark runner path.
 
-Offline: no Godot, no API, no real subprocesses. The process pool is replaced
-with an inline executor and `run_benchmark` is stubbed, so we exercise the
-dispatch, aggregation, and checkpointing logic without spawning anything.
+Offline: no Godot, no API, no real subprocesses. The parent-owned worker
+launcher is replaced with fake processes/queues, so we exercise dispatch,
+aggregation, hard-timeout recovery, and checkpointing without spawning anything.
 """
-import concurrent.futures
-
 import pytest
 import yaml
 
 import gamedevbench.src.benchmark_runner as br
+import gamedevbench.src.godot_ai_editor as gae
 from gamedevbench.src.benchmark_runner import GodotBenchmarkRunner
 
 
-class _InlineExecutor:
-    """Drop-in for ProcessPoolExecutor that runs submitted work synchronously."""
+class _FakeProcess:
+    _next_pid = 1000
 
-    def __init__(self, max_workers=None):
-        self.max_workers = max_workers
+    def __init__(self, *, alive=False, exitcode=0):
+        type(self)._next_pid += 1
+        self.pid = type(self)._next_pid
+        self._alive = alive
+        self.exitcode = exitcode
 
-    def __enter__(self):
-        return self
+    def is_alive(self):
+        return self._alive
 
-    def __exit__(self, *exc):
-        return False
+    def join(self, timeout=None):
+        return None
 
-    def submit(self, fn, *args, **kwargs):
-        fut = concurrent.futures.Future()
-        try:
-            fut.set_result(fn(*args, **kwargs))
-        except Exception as e:  # pragma: no cover - mirrors pool behaviour
-            fut.set_exception(e)
-        return fut
+
+class _FakeQueue:
+    def __init__(self, payload=None):
+        self.payload = payload
+
+    def get_nowait(self):
+        if self.payload is None:
+            raise br.queue.Empty
+        payload = self.payload
+        self.payload = None
+        return payload
 
 
 def _make_runner(tmp_path, **kwargs):
@@ -46,6 +52,36 @@ def _write_task_list(tmp_path, task_names):
     path = tmp_path / "tasks.yaml"
     path.write_text(yaml.safe_dump({"tasks": list(task_names)}))
     return str(path)
+
+
+def _patch_parallel_start(monkeypatch, outcomes):
+    reaped = []
+    killed = []
+
+    def fake_start(ctx, runner, task_name, run_id):
+        outcome = outcomes[task_name]
+        if outcome == "hang":
+            return _FakeProcess(alive=True), _FakeQueue()
+        if isinstance(outcome, Exception):
+            return _FakeProcess(), _FakeQueue(
+                {"kind": "error", "task_name": task_name, "error": repr(outcome)}
+            )
+        return _FakeProcess(), _FakeQueue(
+            {
+                "kind": "result",
+                "task_name": task_name,
+                "result": {
+                    "task_name": task_name,
+                    "success": bool(outcome),
+                    "message": "x",
+                },
+            }
+        )
+
+    monkeypatch.setattr(br, "_start_task_process", fake_start)
+    monkeypatch.setattr(br, "_reap_task_run_artifacts", lambda run_id: reaped.append(run_id))
+    monkeypatch.setattr(br, "terminate_process_tree", lambda pid: killed.append(pid))
+    return reaped, killed
 
 
 def test_workers_floored_to_one():
@@ -107,15 +143,10 @@ def test_workers_passthrough():
 
 
 def test_parallel_runs_all_tasks_and_aggregates(tmp_path, monkeypatch):
-    monkeypatch.setattr(br, "ProcessPoolExecutor", _InlineExecutor)
     runner = _make_runner(tmp_path, workers=4)
 
     outcomes = {"task_a": True, "task_b": False, "task_c": True}
-
-    def fake_run_benchmark(task_name):
-        return {"task_name": task_name, "success": outcomes[task_name], "message": "x"}
-
-    monkeypatch.setattr(runner, "run_benchmark", fake_run_benchmark)
+    _patch_parallel_start(monkeypatch, outcomes)
 
     task_list = _write_task_list(tmp_path, outcomes.keys())
     summary = runner.run_all_tasks(task_list_file=task_list)
@@ -128,21 +159,56 @@ def test_parallel_runs_all_tasks_and_aggregates(tmp_path, monkeypatch):
 
 
 def test_parallel_counts_errors_separately(tmp_path, monkeypatch):
-    monkeypatch.setattr(br, "ProcessPoolExecutor", _InlineExecutor)
     runner = _make_runner(tmp_path, workers=4)
-
-    def fake_run_benchmark(task_name):
-        if task_name == "task_boom":
-            raise RuntimeError("kaboom")
-        return {"task_name": task_name, "success": True, "message": "ok"}
-
-    monkeypatch.setattr(runner, "run_benchmark", fake_run_benchmark)
+    _patch_parallel_start(
+        monkeypatch,
+        {"task_ok": True, "task_boom": RuntimeError("kaboom")},
+    )
 
     task_list = _write_task_list(tmp_path, ["task_ok", "task_boom"])
     summary = runner.run_all_tasks(task_list_file=task_list)
 
     assert summary["success"] == 1
     assert summary["errors"] == 1
+
+
+def test_parallel_hard_timeout_kills_worker_and_continues(tmp_path, monkeypatch):
+    runner = _make_runner(tmp_path, workers=2)
+    runner.worker_hard_timeout_seconds = 0.0
+    reaped, killed = _patch_parallel_start(
+        monkeypatch,
+        {"task_hang": "hang", "task_ok": True, "task_after": True},
+    )
+
+    task_list = _write_task_list(tmp_path, ["task_hang", "task_ok", "task_after"])
+    summary = runner.run_all_tasks(task_list_file=task_list)
+
+    assert summary["success"] == 2
+    assert summary["errors"] == 1
+    timeout_result = next(r for r in summary["tasks"] if r["task_name"] == "task_hang")
+    assert timeout_result["timed_out"] is True
+    assert "hard cap" in timeout_result["message"]
+    assert killed
+    assert len(reaped) == 3
+
+
+def test_reap_task_run_artifacts_removes_temp_dirs_and_servers(tmp_path, monkeypatch):
+    run_id = "abc123"
+    gai_dir = tmp_path / f"gamedevbench_gai_{run_id}_one"
+    codex_dir = tmp_path / f"gamedevbench_codex_{run_id}_two"
+    unrelated = tmp_path / "gamedevbench_gai_other_three"
+    for path in (gai_dir, codex_dir, unrelated):
+        path.mkdir()
+    reaped = []
+    monkeypatch.setattr(br.tempfile, "gettempdir", lambda: str(tmp_path))
+    monkeypatch.setattr(gae, "_reap_servers", lambda path: reaped.append(path))
+
+    br._reap_task_run_artifacts(run_id)
+
+    assert reaped == [gai_dir]
+    assert not gai_dir.exists()
+    assert not codex_dir.exists()
+    assert unrelated.exists()
 
 
 def test_single_worker_uses_sequential_path(tmp_path, monkeypatch):
