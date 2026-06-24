@@ -19,6 +19,13 @@ def test_addon_cache_dir_honors_env(monkeypatch, tmp_path):
     assert gae.addon_cache_dir("2.7.5") == tmp_path / "gamedevbench_godot_ai_2.7.5"
 
 
+def test_addon_cache_dir_sanitizes_non_version_sources(monkeypatch, tmp_path):
+    monkeypatch.setenv("GAMEDEVBENCH_GODOT_AI_CACHE", str(tmp_path))
+    cache = gae.addon_cache_dir("git+https://example.com/hi/godot-ai.git@branch/name")
+    assert cache.parent == tmp_path
+    assert cache.name.startswith("gamedevbench_godot_ai_git_https___example.com")
+
+
 def test_parse_host_port():
     assert gae.parse_host_port("http://127.0.0.1:8000/mcp") == ("127.0.0.1", 8000)
     assert gae.parse_host_port("http://localhost:18000/mcp") == ("localhost", 18000)
@@ -272,6 +279,49 @@ def test_ensure_addon_clones_when_absent(monkeypatch, tmp_path):
     assert (addon / "plugin.cfg").exists()
     # Freshly cloned addon is patched for env ports.
     assert gae.ENV_HTTP_PORT in (addon / "client_configurator.gd").read_text()
+
+
+def test_ensure_addon_copies_from_local_checkout(monkeypatch, tmp_path):
+    monkeypatch.setenv("GAMEDEVBENCH_GODOT_AI_CACHE", str(tmp_path / "cache"))
+    checkout = tmp_path / "checkout"
+    src = checkout / gae._ADDON_SUBPATH
+    _make_addon_files(src)
+
+    def boom(*a, **k):
+        raise AssertionError("local checkout should not be cloned")
+
+    addon = gae.ensure_addon(str(checkout), runner=boom)
+
+    assert addon == gae.addon_cache_dir(str(checkout)) / "addon" / "godot_ai"
+    assert (addon / "plugin.cfg").exists()
+    # The cached copy is patched, leaving the source checkout untouched.
+    assert gae.ENV_HTTP_PORT in (addon / "client_configurator.gd").read_text()
+    assert gae.ENV_HTTP_PORT not in (src / "client_configurator.gd").read_text()
+
+
+def test_ensure_addon_clones_git_ref(monkeypatch, tmp_path):
+    monkeypatch.setenv("GAMEDEVBENCH_GODOT_AI_CACHE", str(tmp_path))
+    source = "git+https://example.com/hi/godot-ai.git@feature-branch"
+    seen = {}
+
+    def fake_clone(cmd, **kwargs):
+        seen["cmd"] = cmd
+        dest = Path(cmd[-1]) / gae._ADDON_SUBPATH
+        _make_addon_files(dest)
+        return _completed(0)
+
+    addon = gae.ensure_addon(source, runner=fake_clone)
+
+    assert seen["cmd"][:6] == [
+        "git",
+        "clone",
+        "--depth",
+        "1",
+        "--branch",
+        "feature-branch",
+    ]
+    assert seen["cmd"][6] == "https://example.com/hi/godot-ai.git"
+    assert (addon / "plugin.cfg").exists()
 
 
 def test_ensure_addon_raises_on_clone_failure(monkeypatch, tmp_path):

@@ -155,7 +155,36 @@ def _godot_mcp_env() -> Dict[str, str]:
 
 #: Pinned hi-godot/godot-ai version — used for both the ``uvx`` server package
 #: and the editor addon checkout so the plugin and server stay in lockstep.
-GODOT_AI_VERSION = "2.7.5"
+GODOT_AI_VERSION_ENV = "GAMEDEVBENCH_GODOT_AI_VERSION"
+GODOT_AI_SOURCE_ENV = "GAMEDEVBENCH_GODOT_AI_SOURCE"
+GODOT_AI_VERSION = os.environ.get(GODOT_AI_VERSION_ENV, "2.7.5")
+
+
+def _strip_local_prefix(source: str) -> str:
+    """Accept ``local:/path`` as a readable alias for a plain path source."""
+    return source[len("local:"):] if source.startswith("local:") else source
+
+
+def godot_ai_package_source() -> str:
+    """Return the ``uvx --from`` source for godot-ai.
+
+    ``GAMEDEVBENCH_GODOT_AI_SOURCE`` may be a local checkout path (optionally
+    prefixed with ``local:``) or a uv-compatible git source such as
+    ``git+https://github.com/hi-godot/godot-ai.git@branch``. When unset, the
+    published package pin is used.
+    """
+    source = os.environ.get(GODOT_AI_SOURCE_ENV)
+    if source:
+        return _strip_local_prefix(source)
+    return f"godot-ai=={GODOT_AI_VERSION}"
+
+
+def godot_ai_addon_source() -> str:
+    """Return the editor-addon source matching the selected server package."""
+    source = os.environ.get(GODOT_AI_SOURCE_ENV)
+    if source:
+        return _strip_local_prefix(source)
+    return GODOT_AI_VERSION
 
 #: Default loopback MCP endpoint the godot-ai editor plugin serves on. The
 #: server runs single-worker (host-global ports), so the default port is safe.
@@ -294,7 +323,7 @@ GODOT_AI = MCPServerSpec(
     # command/args prime the uvx package cache during warm_up (the plugin itself
     # spawns the real server); they are NOT how the agent reaches the server.
     command="uvx",
-    args=("--from", f"godot-ai=={GODOT_AI_VERSION}", "godot-ai", "--version"),
+    args=("--from", godot_ai_package_source(), "godot-ai", "--version"),
     prompt_guidance=_GODOT_AI_GUIDANCE,
     env_factory=_godot_ai_env,
     # The plugin spawns a Python FastMCP server the agent reaches over HTTP.

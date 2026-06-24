@@ -64,7 +64,25 @@ def test_godot_ai_uses_http_transport_via_editor():
     assert spec.needs_godot_editor is True
     # command/args exist only to prime the uvx package cache during warm_up.
     assert spec.command == "uvx"
-    assert f"godot-ai=={mcp_servers.GODOT_AI_VERSION}" in spec.args
+    assert mcp_servers.godot_ai_package_source() in spec.args
+
+
+def test_godot_ai_source_override_points_package_and_addon(monkeypatch):
+    monkeypatch.setenv(
+        mcp_servers.GODOT_AI_SOURCE_ENV,
+        "local:/work/godot-ai",
+    )
+
+    assert mcp_servers.godot_ai_package_source() == "/work/godot-ai"
+    assert mcp_servers.godot_ai_addon_source() == "/work/godot-ai"
+
+
+def test_godot_ai_version_override_keeps_published_package_pin(monkeypatch):
+    monkeypatch.delenv(mcp_servers.GODOT_AI_SOURCE_ENV, raising=False)
+    monkeypatch.setattr(mcp_servers, "GODOT_AI_VERSION", "9.8.7")
+
+    assert mcp_servers.godot_ai_package_source() == "godot-ai==9.8.7"
+    assert mcp_servers.godot_ai_addon_source() == "9.8.7"
 
 
 def test_godot_ai_runs_in_parallel():
@@ -107,7 +125,7 @@ def test_godot_ai_warm_up_primes_uvx(monkeypatch):
     spec = mcp_servers.get_mcp_server("godot-ai")
     assert spec.warm_up() is True
     assert calls["cmd"][0] == "uvx"
-    assert f"godot-ai=={mcp_servers.GODOT_AI_VERSION}" in calls["cmd"]
+    assert mcp_servers.godot_ai_package_source() in calls["cmd"]
 
 
 def test_stdio_servers_carry_no_http_url():

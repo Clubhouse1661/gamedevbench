@@ -32,12 +32,13 @@ import socket
 import subprocess
 import tempfile
 import time
+import hashlib
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
-from gamedevbench.src.mcp_registry import GODOT_AI_VERSION
+from gamedevbench.src.mcp_registry import GODOT_AI_VERSION, godot_ai_addon_source
 
 #: Upstream repo cloned (shallow, pinned tag) to obtain the editor addon.
 GODOT_AI_REPO_URL = "https://github.com/hi-godot/godot-ai.git"
@@ -118,7 +119,16 @@ def addon_tag(version: str = GODOT_AI_VERSION) -> str:
     return f"v{version}"
 
 
-def addon_cache_dir(version: str = GODOT_AI_VERSION) -> Path:
+def _cache_key(source: str) -> str:
+    """Return a filesystem-safe cache key for a version/path/git source."""
+    safe = "".join(c if c.isalnum() or c in "._-" else "_" for c in source)
+    if len(safe) <= 80:
+        return safe
+    digest = hashlib.sha256(source.encode("utf-8")).hexdigest()[:12]
+    return f"{safe[:60]}_{digest}"
+
+
+def addon_cache_dir(source: str = GODOT_AI_VERSION) -> Path:
     """Host-shared cache directory for the checked-out addon.
 
     Overridable with ``GAMEDEVBENCH_GODOT_AI_CACHE``; defaults under the system
@@ -126,51 +136,87 @@ def addon_cache_dir(version: str = GODOT_AI_VERSION) -> Path:
     """
     base = os.environ.get("GAMEDEVBENCH_GODOT_AI_CACHE")
     root = Path(base) if base else Path(__import__("tempfile").gettempdir())
-    return root / f"gamedevbench_godot_ai_{version}"
+    return root / f"gamedevbench_godot_ai_{_cache_key(source)}"
+
+
+def _local_addon_path(source: str) -> Optional[Path]:
+    """Return the addon directory if ``source`` points at a local checkout/addon."""
+    root = Path(source).expanduser()
+    if not root.exists():
+        return None
+    if (root / "plugin.cfg").exists():
+        return root
+    addon = root / _ADDON_SUBPATH
+    if (addon / "plugin.cfg").exists():
+        return addon
+    return None
+
+
+def _clone_spec(source: str, repo_url: str) -> Tuple[str, str]:
+    """Return ``(url, ref)`` for a version string or git source."""
+    if source.startswith("git+"):
+        git_source = source[len("git+"):]
+        if "@" in git_source:
+            url, ref = git_source.rsplit("@", 1)
+        else:
+            url, ref = git_source, "main"
+        return url, ref
+
+    version = source.split("==", 1)[1] if source.startswith("godot-ai==") else source
+    return repo_url, addon_tag(version)
 
 
 def ensure_addon(
-    version: str = GODOT_AI_VERSION,
+    source: Optional[str] = None,
     *,
     repo_url: str = GODOT_AI_REPO_URL,
     runner: Callable[..., subprocess.CompletedProcess] = subprocess.run,
 ) -> Path:
     """Return the path to the cached ``godot_ai`` addon dir, cloning if absent.
 
-    Idempotent: if the addon is already present in the cache, returns
-    immediately without touching the network. Raises ``RuntimeError`` if the
-    clone fails or the expected addon path is missing afterwards.
+    ``source`` may be a published version (``2.7.5``), a local checkout/addon
+    path, or a ``git+...@ref`` source. When omitted, it follows
+    ``GAMEDEVBENCH_GODOT_AI_SOURCE`` / ``GAMEDEVBENCH_GODOT_AI_VERSION`` from
+    the MCP registry. Idempotent: if the addon is already present in the cache,
+    returns immediately without touching the network. Raises ``RuntimeError`` if
+    the clone/copy fails or the expected addon path is missing afterwards.
     """
-    cache = addon_cache_dir(version)
+    source = source or godot_ai_addon_source()
+    cache = addon_cache_dir(source)
     addon = cache / "addon" / "godot_ai"
     if (addon / "plugin.cfg").exists():
         _patch_addon_env_ports(addon)  # idempotent; covers a stale unpatched cache
         return addon
 
-    checkout = cache / "repo"
-    if not (checkout / _ADDON_SUBPATH / "plugin.cfg").exists():
-        shutil.rmtree(checkout, ignore_errors=True)
-        checkout.parent.mkdir(parents=True, exist_ok=True)
-        result = runner(
-            [
-                "git", "clone", "--depth", "1",
-                "--branch", addon_tag(version),
-                repo_url, str(checkout),
-            ],
-            capture_output=True,
-            text=True,
-            timeout=300,
-        )
-        if result.returncode != 0:
-            raise RuntimeError(
-                f"Failed to clone godot-ai {addon_tag(version)}: "
-                f"{(result.stderr or '').strip()[:400]}"
+    local = _local_addon_path(source)
+    if local is not None:
+        src = local
+    else:
+        checkout = cache / "repo"
+        if not (checkout / _ADDON_SUBPATH / "plugin.cfg").exists():
+            shutil.rmtree(checkout, ignore_errors=True)
+            checkout.parent.mkdir(parents=True, exist_ok=True)
+            clone_url, clone_ref = _clone_spec(source, repo_url)
+            result = runner(
+                [
+                    "git", "clone", "--depth", "1",
+                    "--branch", clone_ref,
+                    clone_url, str(checkout),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=300,
             )
+            if result.returncode != 0:
+                raise RuntimeError(
+                    f"Failed to clone godot-ai {clone_ref}: "
+                    f"{(result.stderr or '').strip()[:400]}"
+                )
+        src = checkout / _ADDON_SUBPATH
 
-    src = checkout / _ADDON_SUBPATH
     if not (src / "plugin.cfg").exists():
         raise RuntimeError(
-            f"godot-ai addon not found at {src} after clone"
+            f"godot-ai addon not found at {src} after resolving source {source!r}"
         )
     addon.parent.mkdir(parents=True, exist_ok=True)
     shutil.rmtree(addon, ignore_errors=True)
