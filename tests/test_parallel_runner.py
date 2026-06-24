@@ -142,6 +142,14 @@ def test_workers_passthrough():
     assert runner.workers == 4
 
 
+def test_current_task_run_id_prefers_worker_attribute(tmp_path, monkeypatch):
+    monkeypatch.setenv("GAMEDEVBENCH_TASK_RUN_ID", "from-env")
+    runner = _make_runner(tmp_path)
+    runner._task_run_id = "from-worker"
+
+    assert runner._current_task_run_id() == "from-worker"
+
+
 def test_parallel_runs_all_tasks_and_aggregates(tmp_path, monkeypatch):
     runner = _make_runner(tmp_path, workers=4)
 

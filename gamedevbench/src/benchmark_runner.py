@@ -65,7 +65,9 @@ def _run_task_process_entry(
 ) -> None:
     """Run one task in a child process and send a serializable result."""
     previous_run_id = os.environ.get(_TASK_RUN_ID_ENV)
+    previous_attr = getattr(runner, "_task_run_id", None)
     os.environ[_TASK_RUN_ID_ENV] = run_id
+    runner._task_run_id = run_id
     try:
         result_queue.put(
             {
@@ -87,6 +89,13 @@ def _run_task_process_entry(
             os.environ.pop(_TASK_RUN_ID_ENV, None)
         else:
             os.environ[_TASK_RUN_ID_ENV] = previous_run_id
+        if previous_attr is None:
+            try:
+                delattr(runner, "_task_run_id")
+            except AttributeError:
+                pass
+        else:
+            runner._task_run_id = previous_attr
 
 
 def _start_task_process(
@@ -236,6 +245,10 @@ class GodotBenchmarkRunner:
         sanitized = re.sub(r"[^A-Za-z0-9._-]+", "_", run_name.strip())
         sanitized = sanitized.strip("._-")
         return sanitized or "run"
+
+    def _current_task_run_id(self) -> str:
+        """Return the parent-assigned run id for temp-dir tagging."""
+        return str(getattr(self, "_task_run_id", "") or os.environ.get(_TASK_RUN_ID_ENV, ""))
 
     def _validate_agent_configuration(self):
         """
@@ -650,7 +663,7 @@ script = ExtResource("test_script")
             Path to the sandbox directory in /tmp
         """
         # Create unique sandbox directory in /tmp
-        run_id = os.environ.get(_TASK_RUN_ID_ENV)
+        run_id = self._current_task_run_id()
         id_suffix = f"{run_id}_{uuid.uuid4().hex[:8]}" if run_id else uuid.uuid4().hex[:8]
         sandbox_id = f"gamedevbench_sandbox_{id_suffix}"
         sandbox_dir = Path(tempfile.gettempdir()) / sandbox_id
@@ -1105,7 +1118,7 @@ script = ExtResource("test_script")
             # Step 3: Create validation directory with agent's work + test files
             if self.debug:
                 print(f"[3/5] Preparing validation environment...")
-            run_id = os.environ.get(_TASK_RUN_ID_ENV)
+            run_id = self._current_task_run_id()
             id_suffix = f"{run_id}_{uuid.uuid4().hex[:8]}" if run_id else uuid.uuid4().hex[:8]
             validation_id = f"gamedevbench_validation_{id_suffix}"
             validation_dir = Path(tempfile.gettempdir()) / validation_id
