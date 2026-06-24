@@ -153,6 +153,11 @@ def test_codex_allows_godot_ai_mcp_server():
     assert solver.mcp_server == "godot-ai"
 
 
+def test_codex_accepts_verification_nudge():
+    solver = SolverFactory.create_solver("codex", encourage_verification=True)
+    assert solver.encourage_verification is True
+
+
 def test_codex_rejects_unwired_godot_mcp_server():
     with pytest.raises(ValueError, match="not supported with agent 'codex'"):
         SolverFactory.create_solver(

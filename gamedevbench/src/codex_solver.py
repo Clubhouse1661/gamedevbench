@@ -25,6 +25,7 @@ class CodexSolver(BaseSolver):
     # Solver capabilities (required by BaseSolver)
     SUPPORTS_MCP = True
     SUPPORTS_SYSTEM_PROMPT = False  # Codex embeds context in main prompt
+    SUPPORTS_VERIFICATION_NUDGE = True
 
     def __init__(
         self,
@@ -36,6 +37,7 @@ class CodexSolver(BaseSolver):
         sandbox: str = "danger-full-access",  # read-only | workspace-write | danger-full-access
         use_runtime_video: bool = False,
         mcp_server: str = DEFAULT_MCP_SERVER,
+        encourage_verification: bool = False,
     ):
         # Call parent constructor (handles MCP validation)
         super().__init__(
@@ -44,6 +46,7 @@ class CodexSolver(BaseSolver):
             use_mcp,
             use_runtime_video,
             mcp_server=mcp_server,
+            encourage_verification=encourage_verification,
         )
 
         # Codex-specific parameters

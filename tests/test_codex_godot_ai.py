@@ -42,6 +42,12 @@ def _make_solver(**kwargs):
     return solver
 
 
+def test_codex_verification_nudge_reaches_prompt():
+    solver = CodexSolver(encourage_verification=True)
+    prompt = solver.get_task_prompt({"instruction": "do"})
+    assert "godot --headless --script" in prompt
+
+
 def _completed_codex():
     return subprocess.CompletedProcess(
         ["codex"],
