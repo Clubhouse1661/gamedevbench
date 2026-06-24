@@ -135,12 +135,26 @@ def test_verification_nudge_defaults_off(restore_registry):
     assert solver.encourage_verification is False
 
 
-def test_non_default_mcp_server_requires_openhands(restore_registry):
-    # Only the OpenHands solver honors a server selection today; pairing a
-    # non-default server with any other agent must fail loudly, not silently
-    # fall back to the screenshot baseline.
+def test_unwired_non_default_mcp_server_rejected(restore_registry):
+    # Server selection is per-agent allowlisted. Pairing an unwired server with
+    # an agent must fail loudly, not silently fall back to the screenshot
+    # baseline or emit a partial config.
     SolverFactory.register_solver("dummy-mcp", _DummyMcpSolver)
-    with pytest.raises(ValueError, match="only supported with the 'openhands'"):
+    with pytest.raises(ValueError, match="not supported with agent 'dummy-mcp'"):
         SolverFactory.create_solver(
             "dummy-mcp", use_mcp=True, mcp_server="godot"
+        )
+
+
+def test_codex_allows_godot_ai_mcp_server():
+    solver = SolverFactory.create_solver(
+        "codex", use_mcp=True, mcp_server="godot-ai"
+    )
+    assert solver.mcp_server == "godot-ai"
+
+
+def test_codex_rejects_unwired_godot_mcp_server():
+    with pytest.raises(ValueError, match="not supported with agent 'codex'"):
+        SolverFactory.create_solver(
+            "codex", use_mcp=True, mcp_server="godot"
         )

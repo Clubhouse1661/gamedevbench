@@ -176,17 +176,14 @@ class GodotBenchmarkRunner:
                 f"MCP-capable solvers: {', '.join(mcp_capable)}"
             )
 
-        # Fail fast (before any task runs) if a non-default MCP server is paired
-        # with an agent that doesn't honor the selection yet (OpenHands-only).
-        if (
-            self.use_mcp
-            and self.mcp_server != DEFAULT_MCP_SERVER
-            and self.agent != "openhands"
-        ):
+        # Fail fast (before any task runs) if the selected MCP server is not
+        # wired for this agent.
+        supported_mcp_servers = SolverFactory.supported_mcp_servers(self.agent)
+        if self.use_mcp and self.mcp_server not in supported_mcp_servers:
             raise ValueError(
-                f"--mcp-server {self.mcp_server} is only supported with "
-                f"'--agent openhands' right now; '{self.agent}' uses the "
-                f"'{DEFAULT_MCP_SERVER}' baseline."
+                f"--mcp-server {self.mcp_server} is not supported with "
+                f"--agent {self.agent}. Supported for this agent: "
+                f"{', '.join(sorted(supported_mcp_servers))}."
             )
 
         # Provide informational message in debug mode
@@ -1044,7 +1041,7 @@ script = ExtResource("test_script")
                 shutil.copy2(log_file_path, result_subdir / "agent_trajectory.log")
 
             if self.debug:
-                print(f"✓ Benchmark cycle completed for {task_name}")
+                print(f"Benchmark cycle completed for {task_name}")
                 print(
                     f"  Results saved to: {result_subdir.relative_to(self.tasks_dir.parent)}"
                 )

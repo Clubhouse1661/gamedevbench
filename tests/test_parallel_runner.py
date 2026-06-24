@@ -6,6 +6,7 @@ dispatch, aggregation, and checkpointing logic without spawning anything.
 """
 import concurrent.futures
 
+import pytest
 import yaml
 
 import gamedevbench.src.benchmark_runner as br
@@ -77,6 +78,27 @@ def test_workers_not_clamped_with_godot_ai(capsys):
     )
     assert runner.workers == 8
     assert "forcing workers=1" not in capsys.readouterr().out
+
+
+def test_codex_allows_godot_ai_mcp_server_in_runner_validation():
+    runner = GodotBenchmarkRunner(
+        use_gt=False,
+        agent="codex",
+        use_mcp=True,
+        mcp_server="godot-ai",
+        workers=2,
+    )
+    assert runner.mcp_server == "godot-ai"
+
+
+def test_codex_rejects_unwired_mcp_server_in_runner_validation():
+    with pytest.raises(ValueError, match="not supported with --agent codex"):
+        GodotBenchmarkRunner(
+            use_gt=False,
+            agent="codex",
+            use_mcp=True,
+            mcp_server="godot",
+        )
 
 
 def test_workers_passthrough():

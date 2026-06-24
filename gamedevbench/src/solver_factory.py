@@ -5,7 +5,11 @@ Uses registry pattern for modular solver management.
 """
 from typing import Dict, Type, Optional
 from gamedevbench.src.base_solver import BaseSolver
-from gamedevbench.src.mcp_registry import DEFAULT_MCP_SERVER, get_mcp_server
+from gamedevbench.src.mcp_registry import (
+    DEFAULT_MCP_SERVER,
+    available_mcp_servers,
+    get_mcp_server,
+)
 from gamedevbench.src.claude_code_solver import ClaudeCodeSolver
 from gamedevbench.src.mini_swe_solver import MiniSweSolver
 from gamedevbench.src.codex_solver import CodexSolver
@@ -35,6 +39,17 @@ class SolverFactory:
     if OPENHANDS_AVAILABLE:
         _SOLVER_REGISTRY["openhands"] = OpenHandsSolver
 
+    _MCP_SERVER_ALLOWLIST = {
+        "codex": {DEFAULT_MCP_SERVER, "godot-ai"},
+    }
+
+    @classmethod
+    def supported_mcp_servers(cls, agent: str) -> set[str]:
+        """Return MCP servers wired for an agent."""
+        if agent == "openhands":
+            return set(available_mcp_servers())
+        return cls._MCP_SERVER_ALLOWLIST.get(agent, {DEFAULT_MCP_SERVER})
+
     @classmethod
     def create_solver(
         cls,
@@ -57,9 +72,9 @@ class SolverFactory:
             use_mcp: Enable MCP server functionality (will validate solver supports it)
             timeout_seconds: Maximum time for solver execution
             use_runtime_video: Enable runtime video mode (appends Godot runtime instructions to prompts)
-            mcp_server: Name of the MCP server to use when use_mcp is set. Only
-                the OpenHands solver currently honors a non-default selection;
-                requesting a non-default server for any other agent raises.
+            mcp_server: Name of the MCP server to use when use_mcp is set.
+                OpenHands honors every registered server; Codex currently
+                honors the screenshot baseline and godot-ai.
             encourage_verification: Append the light "construct your own tests"
                 nudge. Only solvers with SUPPORTS_VERIFICATION_NUDGE (OpenHands)
                 accept it; requesting it for any other agent raises.
@@ -107,16 +122,16 @@ class SolverFactory:
                 f"Use --agent openhands or drop the flag."
             )
 
-        # Validate the server name early (fails fast on a typo) and guard the
-        # OpenHands-only wiring: other solvers still hardcode the screenshot
-        # baseline, so a non-default selection there would be silently ignored.
+        # Validate the server name early (fails fast on a typo) and guard
+        # per-agent wiring explicitly. An unwired server must fail loudly rather
+        # than silently producing a default or partial MCP config.
         get_mcp_server(mcp_server)
-        if use_mcp and mcp_server != DEFAULT_MCP_SERVER and agent != "openhands":
+        allowed_servers = cls.supported_mcp_servers(agent)
+        if use_mcp and mcp_server not in allowed_servers:
             raise ValueError(
-                f"Selecting MCP server '{mcp_server}' is only supported with the "
-                f"'openhands' agent right now; agent '{agent}' uses the "
-                f"'{DEFAULT_MCP_SERVER}' baseline. Use --agent openhands or drop "
-                f"--mcp-server."
+                f"Selecting MCP server '{mcp_server}' is not supported with "
+                f"agent '{agent}'. Supported for this agent: "
+                f"{', '.join(sorted(allowed_servers))}."
             )
 
         # Build kwargs based on what each solver accepts
@@ -139,10 +154,8 @@ class SolverFactory:
         if solver_class.SUPPORTS_MCP:
             kwargs["use_mcp"] = use_mcp
 
-        # Only OpenHands accepts a server selection today; other solver __init__s
-        # don't take mcp_server, and the guard above already rejects non-default
-        # selections for them.
-        if agent == "openhands":
+        # Pass server selections only to solvers that accept them.
+        if agent in {"openhands", "codex"}:
             kwargs["mcp_server"] = mcp_server
 
         # Pass the verification nudge to any solver that accepts it (gated by the

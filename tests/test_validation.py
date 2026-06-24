@@ -40,4 +40,14 @@ def test_save_result_to_json(tmp_path):
     assert out.exists()
     data = json.loads(out.read_text())
     assert data["success"] is True
-    assert data["message"] == "ok"
+
+
+def test_save_result_to_json_creates_nested_run_dir(tmp_path):
+    r = ValidationParser.parse_output("VALIDATION_FAILED: nope")
+    results_dir = tmp_path / "results" / "named-run"
+    ValidationParser.save_result_to_json("task_0002", r, results_dir=results_dir)
+
+    out = results_dir / "task_task_0002.json"
+    assert out.exists()
+    data = json.loads(out.read_text())
+    assert data["message"] == "nope"
