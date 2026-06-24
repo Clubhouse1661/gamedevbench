@@ -116,6 +116,24 @@ def test_godot_ai_writes_task_local_http_config_and_runs_editor(
     assert "enabled = true" in captured["config"]
 
 
+def test_codex_subprocess_decodes_utf8_with_replacement(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    captured = {}
+
+    def fake_run(cmd, **kwargs):
+        captured.update(kwargs)
+        return _completed_codex()
+
+    monkeypatch.setattr(codex.subprocess, "run", fake_run)
+    solver = _make_solver()
+
+    result = solver.solve_task()
+
+    assert result.success is True
+    assert captured["encoding"] == "utf-8"
+    assert captured["errors"] == "replace"
+
+
 def test_godot_ai_editor_and_codex_home_are_cleaned_up_on_timeout(
     monkeypatch, tmp_path
 ):
